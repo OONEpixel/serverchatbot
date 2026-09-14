@@ -1,0 +1,1 @@
+"""Matrix–Minecraft bridge backend."""

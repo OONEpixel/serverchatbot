@@ -1,0 +1,15 @@
+.gradle/
+.gradle-user-home/
+build/
+dist/
+out/
+.idea/
+*.iml
+run/
+.backend-test-venv/
+.docker-task-config/
+__pycache__/
+backend/data/
+backend/secrets/
+backend/.env
+deploy.local.psd1

@@ -1,0 +1,34 @@
+# The bot backend hosts this WebSocket endpoint. Keep it on loopback when both
+# processes are on the same machine.
+bridge:
+  enabled: true
+  url: "ws://127.0.0.1:8765/minecraft"
+  server-id: "survival"
+  server-name: "生存服"
+  relay-group: "main"
+  # Minecraft 对外游戏端口，用于机器人展示和管理，不作为认证凭据。
+  game-port: 25565
+  token: "CHANGE_ME"
+  connect-timeout-seconds: 10
+  reconnect-initial-seconds: 1
+  reconnect-max-seconds: 30
+  max-pending-events: 1000
+  max-inbound-message-length: 500
+
+events:
+  player-join: true
+  player-quit: true
+  player-chat: true
+  player-death: true
+  advancement: true
+
+inbound:
+  # sender/message are inserted as plain text, so Matrix users cannot inject
+  # MiniMessage tags. The surrounding format may use MiniMessage tags.
+  format: "<dark_aqua>[Matrix]</dark_aqua> <aqua><sender></aqua><gray>: </gray><white><message></white>"
+  log-to-console: true
+
+relay:
+  # 跨服消息由插件直接广播，不会再次触发玩家聊天事件。
+  format: '<gold>[<server>]</gold><aqua>\<<author>></aqua><white><message></white>'
+  log-to-console: true

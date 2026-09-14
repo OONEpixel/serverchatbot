@@ -1,0 +1,25 @@
+name: MatrixChatBridge
+version: '${version}'
+main: dev.serverchatbot.matrixbridge.MatrixBridgePlugin
+api-version: '1.21'
+description: Bridges Leaf/Paper server events and Matrix room messages.
+authors: [serverchatbot]
+
+commands:
+  matrixbridge:
+    description: Shows or manages the Matrix bridge connection.
+    usage: /matrixbridge <status|reconnect|reload|token generate>
+    permission: matrixbridge.admin
+  matrixbind:
+    description: Binds your Minecraft player name to a Matrix account using a verification code.
+    aliases: [bind]
+    usage: /matrixbind <code>
+    permission: matrixbridge.bind
+
+permissions:
+  matrixbridge.admin:
+    description: Allows management of MatrixChatBridge.
+    default: op
+  matrixbridge.bind:
+    description: Allows a player to submit a Matrix binding code.
+    default: true

@@ -1,0 +1,40 @@
+services:
+  matrix-serverchat:
+    build: .
+    container_name: matrix-serverchat
+    restart: unless-stopped
+    environment:
+      MATRIX_URL: "${MATRIX_URL:?Set MATRIX_URL in backend/.env}"
+      MATRIX_ID: "${MATRIX_ID:?Set MATRIX_ID in backend/.env}"
+      MATRIX_PASSWORD_FILE: "/run/secrets/matrix_password"
+      ROOM_ID: "${ROOM_ID:?Set ROOM_ID in backend/.env}"
+      WS_HOST: "0.0.0.0"
+      WS_PORT: "8765"
+      DATABASE_PATH: "/data/bridge.db"
+      MAX_MATRIX_MESSAGE_LENGTH: "256"
+      BIND_TOKEN_TTL_SECONDS: "600"
+      # 管理员可按秒调整；默认每位未绑定用户最多每 5 分钟提醒一次。
+      UNBOUND_REMINDER_COOLDOWN_SECONDS: "300"
+      # scoped：按服务器绑定，适合离线服；online_uuid：正版 UUID 全服通用。
+      BINDING_MODE: "scoped"
+      MATRIX_RELAY_GROUP: "main"
+      # 管理员必须同时登记在本地管理员表中，并达到此房间权限等级。
+      ADMIN_POWER_LEVEL: "50"
+      # 玩家头像：本地缓存并在每周日北京时间 00:00 刷新。
+      AVATAR_ENABLED: "true"
+      AVATAR_DIRECTORY: "/data/avatars"
+      AVATAR_LOOKUP_TIMEOUT_SECONDS: "8"
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - ./data:/data
+    secrets:
+      - source: matrix_password
+        target: matrix_password
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+
+secrets:
+  matrix_password:
+    file: ./secrets/matrix_password
