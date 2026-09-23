@@ -1,5 +1,12 @@
 # MatrixChatBridge
 
+## 文档 / Documentation
+
+- 管理与运维：[中文](docs/管理员操作手册-0.4.9.md) / [English](docs/administrator-manual-0.4.9.en.md)
+- 跨 VPS 与多服务端部署：[中文](docs/跨VPS与多服务端部署指南.md) / [English](docs/deployment-multi-server.en.md)
+- 多平台与多版本适配规划：[中文](docs/多平台与多版本适配规划.md) / [English](docs/multi-platform-roadmap.en.md)
+- WebSocket 协议 v2：[中文](docs/protocol.zh-CN.md) / [English](docs/protocol.md)
+
 管理与运维请参阅 [管理员操作手册 0.4.9](docs/管理员操作手册-0.4.9.md)。
 跨机器部署及一机多服请参阅
 [跨 VPS 与多服务端部署指南](docs/跨VPS与多服务端部署指南.md)。
@@ -29,7 +36,7 @@ MatrixChatBridge ── WebSocket + JSON ──► Matrix bot backend ──► 
 
 可信局域网可使用内网 `ws://` 地址；跨公网或不可信网络必须通过 TLS 反向代理使用 `wss://`。
 
-消息协议使用 JSON，0.4.9 对应 `v: 2`。事件有全局 UUID，双方通过 `ack` 确认；掉线期间插件最多在内存中保存 `max-pending-events` 条未确认事件，重连后重发。完整协议见 [docs/protocol.md](docs/protocol.md)。
+消息协议使用 JSON，0.4.9 对应 `v: 2`。事件有全局 UUID，双方通过 `ack` 确认；掉线期间插件最多在内存中保存 `max-pending-events` 条未确认事件，重连后重发。完整协议见 [中文版](docs/protocol.zh-CN.md) / [English](docs/protocol.md)。
 
 ## 已实现
 
@@ -119,7 +126,7 @@ Matrix 管理采用双重鉴权：完整 Matrix ID 必须登记为 `owner` 或 `
 
 ## 机器人后台的责任边界
 
-后台需要完成 Matrix SDK 登录、房间过滤及消息发送，并实现 [v2 协议](docs/protocol.md)：
+后台需要完成 Matrix SDK 登录、房间过滤及消息发送，并实现 v2 协议（[中文版](docs/protocol.zh-CN.md) / [English](docs/protocol.md)）：
 
 - WebSocket 握手时按服务器表验证独立 Bearer Token 和 `X-Minecraft-Server-Id`。
 - 收到 `player_*` 后先用外层 `id` 去重，再发送到正确的 Matrix 房间，成功后回 `ack`。

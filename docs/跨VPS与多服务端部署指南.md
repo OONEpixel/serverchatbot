@@ -1,5 +1,7 @@
 # MatrixChatBridge 跨 VPS 与多服务端部署指南
 
+简体中文 | [English](deployment-multi-server.en.md)
+
 本文面向机器人后端迁移到独立 VPS、同一台 Minecraft 主机运行多个服务端的
 场景，适用于当前 0.4.9（协议 v2）。
 

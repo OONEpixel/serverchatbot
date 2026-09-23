@@ -1,5 +1,7 @@
 # Minecraft–Matrix Bridge Protocol v2
 
+English | [简体中文](protocol.zh-CN.md)
+
 ## 1. Terminology
 
 - **Plugin side / frontend**: the Minecraft plugin installed in Leaf/Paper.
