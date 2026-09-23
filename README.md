@@ -1,11 +1,13 @@
 # MatrixChatBridge
 
-## 文档 / Documentation
+简体中文 | [English](README.en.md)
 
-- 管理与运维：[中文](docs/管理员操作手册-0.4.9.md) / [English](docs/administrator-manual-0.4.9.en.md)
-- 跨 VPS 与多服务端部署：[中文](docs/跨VPS与多服务端部署指南.md) / [English](docs/deployment-multi-server.en.md)
-- 多平台与多版本适配规划：[中文](docs/多平台与多版本适配规划.md) / [English](docs/multi-platform-roadmap.en.md)
-- WebSocket 协议 v2：[中文](docs/protocol.zh-CN.md) / [English](docs/protocol.md)
+## 文档
+
+- [管理员操作手册 0.4.9](docs/管理员操作手册-0.4.9.md)
+- [跨 VPS 与多服务端部署指南](docs/跨VPS与多服务端部署指南.md)
+- [多平台与多版本适配规划](docs/多平台与多版本适配规划.md)
+- [WebSocket 协议 v2](docs/protocol.zh-CN.md)
 
 管理与运维请参阅 [管理员操作手册 0.4.9](docs/管理员操作手册-0.4.9.md)。
 跨机器部署及一机多服请参阅
