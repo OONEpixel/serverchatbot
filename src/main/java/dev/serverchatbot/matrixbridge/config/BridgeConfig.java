@@ -25,7 +25,7 @@ public record BridgeConfig(
         boolean logRelayToConsole
 ) {
     public static BridgeConfig from(FileConfiguration config) {
-        URI url = parseWebSocketUri(config.getString("bridge.url", "ws://127.0.0.1:8765/minecraft"));
+        URI url = parseWebSocketUri(config.getString("bridge.url", "ws://127.0.0.1:8766/minecraft"));
         String serverId = requireText(config.getString("bridge.server-id"), "bridge.server-id");
         String serverName = requireText(config.getString("bridge.server-name", serverId), "bridge.server-name");
         String relayGroup = requireText(config.getString("bridge.relay-group", "main"), "bridge.relay-group");

@@ -13,3 +13,8 @@ backend/data/
 backend/secrets/
 backend/.env
 deploy.local.psd1
+
+# Machine-specific LAN migration helpers and topology notes.
+configure-lan-*.ps1
+deploy/remote-configure-lan-*.sh
+docs/局域网分机部署-*.md

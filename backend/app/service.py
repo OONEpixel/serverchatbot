@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import logging
+import math
 import re
 import secrets
 import shlex
@@ -10,7 +12,7 @@ import string
 import time
 import uuid
 from contextvars import ContextVar, Token
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from nio import (
@@ -25,6 +27,7 @@ from nio import (
     RoomSendResponse,
     StickerEvent,
     SyncResponse,
+    UploadResponse,
     WhoamiResponse,
 )
 from websockets.asyncio.server import ServerConnection, serve
@@ -33,6 +36,8 @@ from websockets.exceptions import ConnectionClosed
 from .avatars import AvatarManager
 from .config import Settings
 from .database import Binding, Database, Server
+from .games import GameManager
+from .online_board import BoardPlayer, BoardServer, render_online_board
 from .mentions import (
     MentionTarget,
     avatar_message_content,
@@ -64,13 +69,17 @@ PLAYER_EVENT_TYPES = {
     "player_advancement",
 }
 MATRIX_COMMAND_PREFIXES = frozenset({"!", "#"})
+PING_QUERY_TIMEOUT_SECONDS = 3.0
 
 
 def matrix_command(text: str) -> str | None:
     if len(text) < 2 or text[0] not in MATRIX_COMMAND_PREFIXES:
         return None
     command = text[1:].split(maxsplit=1)[0].casefold()
-    return command if command in {"bind", "list", "help", "server", "admin"} else None
+    return command if command in {
+        "bind", "list", "help", "server", "admin", "avatar", "reconnect", "ping",
+        "game", "online", "在线榜",
+    } else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +95,40 @@ class ThreadTarget:
     reply_to_event_id: str
 
 
+@dataclass(slots=True)
+class ReconnectActivity:
+    joined_at: float | None = None
+    qualifying_quits: list[float] = field(default_factory=list)
+    rapid_quits: list[float] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ServerHealthState:
+    connected: bool = False
+    outage_started_at: float | None = None
+    offline_notice_sent: bool = False
+    generation: int = 0
+    pending_task: asyncio.Task[None] | None = None
+    last_notice_at: float = 0.0
+    planned_shutdown: bool = False
+
+
+@dataclass(slots=True)
+class PendingOnlineBoard:
+    expected: set[str]
+    results: dict[str, tuple[int, tuple[BoardPlayer, ...]]] = field(default_factory=dict)
+    complete: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+@dataclass(frozen=True, slots=True)
+class PingSample:
+    round_trip_ms: int
+    online_count: int
+    players: tuple[tuple[str, int | None], ...]
+    tps_1m: float | None
+    mspt: float | None
+
+
 class MatrixBridgeService:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -96,6 +139,12 @@ class MatrixBridgeService:
         self.bind_tokens: dict[str, BindToken] = {}
         self.reminder_times: dict[str, float] = {}
         self.online_query_threads: dict[str, tuple[ThreadTarget, float]] = {}
+        self.ping_queries: dict[str, tuple[str, float, asyncio.Future[PingSample]]] = {}
+        self.expired_ping_queries: dict[str, float] = {}
+        self.board_queries: dict[str, tuple[PendingOnlineBoard, str]] = {}
+        self.expired_board_queries: dict[str, float] = {}
+        self.board_last_request: dict[str, float] = {}
+        self.games = GameManager()
         self.command_thread: ContextVar[ThreadTarget | None] = ContextVar(
             f"matrix_command_thread_{id(self)}", default=None
         )
@@ -105,12 +154,31 @@ class MatrixBridgeService:
             settings.avatar_directory,
             settings.avatar_lookup_timeout_seconds,
         )
+        saved_avatar_mode = self.database.get_setting("avatar_display_mode")
+        self.avatar_display_mode = (
+            saved_avatar_mode
+            if saved_avatar_mode in {"text", "emote"}
+            else settings.avatar_display_mode
+        )
+        self.avatar_mode_lock = asyncio.Lock()
+        self.reconnect_activity: dict[tuple[str, str], ReconnectActivity] = {}
+        self.reconnect_guard_task: asyncio.Task[None] | None = None
+        self.server_health: dict[str, ServerHealthState] = {}
+        self.shutting_down = False
 
     async def run(self) -> None:
         try:
             await self._authenticate_matrix()
-            if self.settings.avatar_enabled:
+            if self._avatar_emotes_enabled():
                 await self.avatar_manager.start()
+            if self.settings.reconnect_guard_enabled:
+                self.database.expire_reconnect_mutes(
+                    self.settings.reconnect_guard_quiet_seconds
+                )
+                self.reconnect_guard_task = asyncio.create_task(
+                    self._reconnect_guard_cleanup_loop(),
+                    name="reconnect-guard-cleanup",
+                )
             sync_token = await self._prepare_sync()
             self._register_callbacks()
             LOGGER.info(
@@ -134,6 +202,23 @@ class MatrixBridgeService:
                     set_presence="online",
                 )
         finally:
+            self.shutting_down = True
+            for state in self.server_health.values():
+                if state.pending_task is not None:
+                    state.pending_task.cancel()
+            await asyncio.gather(
+                *(
+                    state.pending_task
+                    for state in self.server_health.values()
+                    if state.pending_task is not None
+                ),
+                return_exceptions=True,
+            )
+            if self.reconnect_guard_task is not None:
+                self.reconnect_guard_task.cancel()
+                await asyncio.gather(
+                    self.reconnect_guard_task, return_exceptions=True
+                )
             await self.avatar_manager.close()
             await self.matrix_client.close()
             self.database.close()
@@ -210,6 +295,26 @@ class MatrixBridgeService:
                 await self._handle_server_command(room, event, text)
             elif command == "admin":
                 await self._handle_admin_command(room, event, text)
+            elif command == "avatar":
+                await self._handle_avatar_command(room, event, text)
+            elif command == "reconnect":
+                await self._handle_reconnect_command(room, event, text)
+            elif command == "ping":
+                await self._send_ping_status(event.sender)
+            elif command == "game":
+                binding = self.database.get_binding_by_matrix(event.sender)
+                actor_name = (
+                    binding.player_id if binding is not None else
+                    room.user_name(event.sender)
+                    or event.sender.split(":", 1)[0].lstrip("@")
+                )
+                await self._handle_game_command(
+                    self.settings.matrix_relay_group, f"matrix:{event.sender}",
+                    actor_name, text,
+                    event.sender,
+                )
+            elif command in {"online", "在线榜"}:
+                await self._request_online_board(event.sender)
             elif command == "help":
                 await self._send_command_help(room, event.sender)
             elif command == "bind":
@@ -329,6 +434,107 @@ class MatrixBridgeService:
             )
         LOGGER.info("已向 %d 台服务器下发在线玩家查询", len(targets))
 
+    async def _request_online_board(self, requester: str) -> None:
+        now = time.monotonic()
+        self.expired_board_queries = {
+            request_id: expiry for request_id, expiry in self.expired_board_queries.items()
+            if expiry > now
+        }
+        if now - self.board_last_request.get(requester, -1e9) < 15:
+            await self._send_user_notice(requester, "⏳ 在线榜每 15 秒可查询一次。")
+            return
+        self.board_last_request[requester] = now
+        servers = self.database.all_servers()
+        targets = {
+            server.server_id: self.servers[server.server_id]
+            for server in servers
+            if server.enabled and server.server_id in self.servers
+        }
+        pending = PendingOnlineBoard(set(targets))
+        try:
+            for server_id, websocket in targets.items():
+                request_id = str(uuid.uuid4())
+                self.board_queries[request_id] = (pending, server_id)
+                await self._send_to_server(
+                    server_id, websocket, "query_list_request",
+                    {"requester": requester, "includeLeaderboard": True},
+                    message_id=request_id,
+                )
+            if targets:
+                try:
+                    await asyncio.wait_for(pending.complete.wait(), timeout=5)
+                except TimeoutError:
+                    LOGGER.info("在线榜查询超时，已收到 %d/%d 台回复", len(pending.results), len(targets))
+            entries = [
+                BoardServer(
+                    server.server_id, server.display_name,
+                    "disabled" if not server.enabled else (
+                        "online" if server.server_id in pending.results else "offline"
+                    ),
+                    *(pending.results.get(server.server_id, (0, ()))),
+                )
+                for server in servers
+            ]
+            png, width, height = await asyncio.to_thread(render_online_board, entries)
+            response, _ = await asyncio.wait_for(
+                self.matrix_client.upload(
+                    io.BytesIO(png), content_type="image/png",
+                    filename="server-online-board.png", filesize=len(png),
+                ),
+                timeout=20,
+            )
+            if not isinstance(response, UploadResponse):
+                raise RuntimeError(f"上传在线榜失败: {response}")
+            await self._send_room_content({
+                "msgtype": "m.image", "body": "服务器在线榜.png",
+                "url": response.content_uri,
+                "info": {"mimetype": "image/png", "size": len(png), "w": width, "h": height},
+            })
+        except Exception:
+            self.board_last_request.pop(requester, None)
+            LOGGER.exception("生成或发送在线榜失败")
+            await self._send_user_notice(requester, "⚠️ 在线榜暂时生成失败，请稍后重试。")
+        finally:
+            for request_id, item in self.board_queries.items():
+                if item[0] is pending:
+                    self.expired_board_queries[request_id] = time.monotonic() + 120
+            self.board_queries = {
+                request_id: item for request_id, item in self.board_queries.items()
+                if item[0] is not pending
+            }
+
+    async def _handle_game_command(
+        self, group: str, actor_id: str, actor_name: str, text: str,
+        requester: str | None = None, source_server: str | None = None,
+    ) -> None:
+        response, broadcast = self.games.play(group, actor_id, actor_name, text)
+        if broadcast:
+            if group == self.settings.matrix_relay_group:
+                await self._send_room_content(
+                    multiline_text_content(response), use_command_thread=False
+                )
+            event_id = str(uuid.uuid4())
+            for server_id, websocket in self._connected_servers_in_group(group).items():
+                await self._send_to_server(server_id, websocket, "matrix_message", {
+                    "roomId": self.settings.room_id,
+                    "eventId": event_id,
+                    "sender": self.settings.matrix_id,
+                    "senderDisplayName": "游戏助手",
+                    "body": response,
+                })
+        elif requester is not None:
+            await self._send_user_notice(requester, response)
+        elif source_server is not None and source_server in self.servers:
+            await self._send_to_server(
+                source_server, self.servers[source_server], "matrix_message", {
+                    "roomId": self.settings.room_id,
+                    "eventId": str(uuid.uuid4()),
+                    "sender": self.settings.matrix_id,
+                    "senderDisplayName": "游戏助手",
+                    "body": response,
+                },
+            )
+
     async def _push_to_minecraft(self, room_id: str, event: Any, body: str) -> None:
         mentioned_ids = self._matrix_mentioned_user_ids(event)
         targets = self._connected_servers_in_group(self.settings.matrix_relay_group)
@@ -365,6 +571,8 @@ class MatrixBridgeService:
         except ConnectionClosed:
             if self.servers.get(server_id) is websocket:
                 self.servers.pop(server_id, None)
+                self.connection_token_hashes.pop(server_id, None)
+                self._mark_server_disconnected(server_id)
             LOGGER.warning("向 Minecraft 服务器 %s 发送消息失败：连接已关闭", server_id)
 
     async def _websocket_handler(self, websocket: ServerConnection) -> None:
@@ -411,7 +619,186 @@ class MatrixBridgeService:
             if self.servers.get(server_id) is websocket:
                 self.servers.pop(server_id, None)
                 self.connection_token_hashes.pop(server_id, None)
+                self._mark_server_disconnected(server_id)
             LOGGER.info("Minecraft 服务器 %s 已断开", server_id)
+
+    def _mark_server_connected(self, server_id: str) -> None:
+        if not self.settings.server_health_enabled or self.shutting_down:
+            return
+        state = self.server_health.get(server_id)
+        if state is None:
+            self.server_health[server_id] = ServerHealthState(connected=True)
+            return
+        if state.connected:
+            return
+        state.connected = True
+        state.generation += 1
+        self._cancel_health_task(state)
+        if state.offline_notice_sent:
+            self._schedule_health_notice(
+                server_id,
+                expected_connected=True,
+                immediate=state.planned_shutdown,
+            )
+
+    def _mark_server_disconnected(self, server_id: str) -> None:
+        if not self.settings.server_health_enabled or self.shutting_down:
+            return
+        state = self.server_health.setdefault(
+            server_id, ServerHealthState(connected=True)
+        )
+        if not state.connected:
+            return
+        state.connected = False
+        state.outage_started_at = time.monotonic()
+        state.generation += 1
+        self._cancel_health_task(state)
+        if not state.offline_notice_sent:
+            self._schedule_health_notice(server_id, expected_connected=False)
+
+    @staticmethod
+    def _cancel_health_task(state: ServerHealthState) -> None:
+        if state.pending_task is not None and not state.pending_task.done():
+            state.pending_task.cancel()
+        state.pending_task = None
+
+    def _schedule_health_notice(
+        self, server_id: str, expected_connected: bool, immediate: bool = False
+    ) -> None:
+        state = self.server_health[server_id]
+        generation = state.generation
+        task = asyncio.create_task(
+            self._delayed_health_notice(
+                server_id, expected_connected, generation, immediate
+            ),
+            name=f"server-health-{server_id}",
+        )
+        state.pending_task = task
+
+    async def _delayed_health_notice(
+        self,
+        server_id: str,
+        expected_connected: bool,
+        generation: int,
+        immediate: bool = False,
+    ) -> None:
+        current_task = asyncio.current_task()
+        try:
+            await asyncio.sleep(
+                0 if immediate else self.settings.server_health_grace_seconds
+            )
+            while not self.shutting_down:
+                state = self.server_health.get(server_id)
+                if (
+                    state is None
+                    or state.generation != generation
+                    or state.connected != expected_connected
+                ):
+                    return
+                remaining = 0 if immediate else (
+                    self.settings.server_health_min_notice_interval_seconds
+                    - (time.monotonic() - state.last_notice_at)
+                )
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                    continue
+                try:
+                    await self._send_server_health_notice(
+                        server_id, expected_connected, state
+                    )
+                except Exception:
+                    LOGGER.exception(
+                        "发送服务器 %s 连接状态通知失败，将稍后重试",
+                        server_id,
+                    )
+                    await asyncio.sleep(30)
+                    continue
+                state.last_notice_at = time.monotonic()
+                if expected_connected:
+                    state.offline_notice_sent = False
+                    state.outage_started_at = None
+                    state.planned_shutdown = False
+                else:
+                    state.offline_notice_sent = True
+                return
+        finally:
+            state = self.server_health.get(server_id)
+            if state is not None and state.pending_task is current_task:
+                state.pending_task = None
+
+    async def _send_server_health_notice(
+        self,
+        server_id: str,
+        connected: bool,
+        state: ServerHealthState,
+    ) -> None:
+        server = self.database.get_server(server_id)
+        if (
+            server is None
+            or not server.enabled
+            or server.relay_group != self.settings.matrix_relay_group
+        ):
+            return
+        if connected:
+            outage_seconds = max(
+                0,
+                int(
+                    time.monotonic()
+                    - (state.outage_started_at or time.monotonic())
+                ),
+            )
+            title = (
+                "✅ Minecraft 服务器重启成功"
+                if state.planned_shutdown
+                else "✅ Minecraft 连接已恢复"
+            )
+            text = (
+                f"{title}\n"
+                f"服务器：{server.display_name} ({server.server_id})\n"
+                f"中断时长：约 {self._format_duration(outage_seconds)}\n"
+                "插件已重新连接机器人后台，消息转发恢复正常。"
+            )
+        else:
+            text = (
+                "⚠️ Minecraft 连接异常\n"
+                f"服务器：{server.display_name} ({server.server_id})\n"
+                f"插件与机器人后台已持续断开至少 {self._format_duration(self.settings.server_health_grace_seconds)}。\n"
+                "可发送 #ping 查看实时连接状态。"
+            )
+        await self._send_room_content(
+            multiline_text_content(text), use_command_thread=False
+        )
+
+    async def _handle_server_stopping(self, server_id: str) -> None:
+        if not self.settings.server_health_enabled or self.shutting_down:
+            return
+        server = self.database.get_server(server_id)
+        if (
+            server is None
+            or not server.enabled
+            or server.relay_group != self.settings.matrix_relay_group
+        ):
+            return
+        state = self.server_health.setdefault(
+            server_id, ServerHealthState(connected=True)
+        )
+        if state.planned_shutdown:
+            return
+        state.planned_shutdown = True
+        state.outage_started_at = time.monotonic()
+        state.offline_notice_sent = True
+        state.generation += 1
+        self._cancel_health_task(state)
+        state.last_notice_at = time.monotonic()
+        await self._send_room_content(
+            multiline_text_content(
+                "🔄 Minecraft 服务器正在关闭或重启\n"
+                f"服务器：{server.display_name} ({server.server_id})\n"
+                "插件已发出正常停服信号，聊天转发将暂时停止。\n"
+                "若服务器正在重启，重新连接成功后会再次通知。"
+            ),
+            use_command_thread=False,
+        )
 
     async def _process_minecraft_message(
         self, websocket: ServerConnection, raw_message: str, server_id: str
@@ -446,6 +833,7 @@ class MatrixBridgeService:
 
         if message_type == "hello":
             self._validate_hello(server_id, payload)
+            self._mark_server_connected(server_id)
             return
         if message_type == "ping":
             await self._send_envelope(
@@ -480,6 +868,9 @@ class MatrixBridgeService:
             elif message_type == "bind_confirm":
                 await self._confirm_binding(websocket, server_id, payload)
                 self.database.mark_processed(source, message_id)
+            elif message_type == "server_stopping":
+                await self._handle_server_stopping(server_id)
+                self.database.mark_processed(source, message_id)
             else:
                 LOGGER.warning("忽略来自 %s 的未知消息类型: %s", server_id, message_type)
         except Exception:
@@ -494,9 +885,20 @@ class MatrixBridgeService:
     ) -> None:
         player_name = extract_player_name(payload)
         plain_text = extract_plain_text(payload)
+        if message_type == "player_chat" and matrix_command(plain_text.strip()) == "game":
+            await self._handle_game_command(
+                server.relay_group, f"minecraft:{server.server_id}:{player_name}",
+                player_name, plain_text.strip(), source_server=server.server_id,
+            )
+            return
+        if message_type in {"player_join", "player_quit"}:
+            if await self._handle_reconnect_guard(
+                server, message_type, player_name
+            ):
+                return
         avatar_mxc_uri = (
             self.avatar_manager.avatar_for(player_name)
-            if self.settings.avatar_enabled
+            if self._avatar_emotes_enabled()
             else None
         )
         if message_type == "player_join":
@@ -504,12 +906,14 @@ class MatrixBridgeService:
                 f"[{server.display_name}]{player_name}上线了",
                 player_name,
                 avatar_mxc_uri,
+                self.avatar_display_mode,
             )
         elif message_type == "player_quit":
             content = avatar_message_content(
                 f"[{server.display_name}]{player_name}下线了",
                 player_name,
                 avatar_mxc_uri,
+                self.avatar_display_mode,
             )
         elif message_type == "player_chat":
             content = game_chat_content(
@@ -518,6 +922,7 @@ class MatrixBridgeService:
                 plain_text,
                 self._mention_targets(server.relay_group),
                 avatar_mxc_uri,
+                self.avatar_display_mode,
             )
         else:
             fallback = f"{player_name} 触发了 {message_type}"
@@ -525,6 +930,7 @@ class MatrixBridgeService:
                 f"[{server.display_name}]{plain_text or fallback}",
                 player_name,
                 avatar_mxc_uri,
+                self.avatar_display_mode,
             )
         # Reusing the Minecraft envelope ID as Matrix transaction ID makes a
         # retry idempotent at the homeserver as well as in our SQLite ledger.
@@ -534,6 +940,136 @@ class MatrixBridgeService:
             await self._relay_player_chat(
                 server, payload, player_name, plain_text, message_id
             )
+
+    def _avatar_emotes_enabled(self) -> bool:
+        return (
+            self.settings.avatar_enabled
+            and self.avatar_display_mode == "emote"
+        )
+
+    async def _handle_reconnect_guard(
+        self,
+        server: Server,
+        message_type: str,
+        player_name: str,
+        now: float | None = None,
+    ) -> bool:
+        if not self.settings.reconnect_guard_enabled:
+            return False
+        key = (server.server_id, player_name.casefold())
+        if self.database.refresh_reconnect_mute(
+            server.server_id,
+            player_name,
+            self.settings.reconnect_guard_quiet_seconds,
+        ):
+            return True
+
+        current_time = time.monotonic() if now is None else now
+        activity = self.reconnect_activity.setdefault(
+            key, ReconnectActivity()
+        )
+        cutoff = current_time - self.settings.reconnect_guard_window_seconds
+        activity.qualifying_quits = [
+            item for item in activity.qualifying_quits if item >= cutoff
+        ]
+        rapid_cutoff = (
+            current_time - self.settings.reconnect_guard_rapid_window_seconds
+        )
+        activity.rapid_quits = [
+            item for item in activity.rapid_quits if item >= rapid_cutoff
+        ]
+
+        if message_type == "player_join":
+            activity.joined_at = current_time
+            return False
+        if activity.joined_at is None:
+            return False
+
+        session_seconds = current_time - activity.joined_at
+        activity.joined_at = None
+        is_auth_timeout_session = (
+            self.settings.reconnect_guard_min_session_seconds
+            <= session_seconds
+            <= self.settings.reconnect_guard_max_session_seconds
+        )
+        is_rapid_session = (
+            0
+            <= session_seconds
+            <= self.settings.reconnect_guard_rapid_max_session_seconds
+        )
+        if not is_auth_timeout_session and not is_rapid_session:
+            activity.qualifying_quits.clear()
+            activity.rapid_quits.clear()
+            return False
+
+        if is_auth_timeout_session:
+            activity.qualifying_quits.append(current_time)
+        if is_rapid_session:
+            activity.rapid_quits.append(current_time)
+        auth_loop = (
+            len(activity.qualifying_quits)
+            >= self.settings.reconnect_guard_threshold
+        )
+        rapid_loop = (
+            len(activity.rapid_quits)
+            >= self.settings.reconnect_guard_rapid_threshold
+        )
+        if not auth_loop and not rapid_loop:
+            return False
+
+        newly_muted = self.database.mute_reconnect_player(
+            server.server_id, player_name
+        )
+        self.reconnect_activity.pop(key, None)
+        if newly_muted:
+            await self._send_reconnect_warning(server, player_name)
+        return True
+
+    async def _send_reconnect_warning(
+        self, server: Server, player_name: str
+    ) -> None:
+        if server.relay_group != self.settings.matrix_relay_group:
+            return
+        binding = self.database.get_binding_by_player(
+            player_name, server.server_id
+        )
+        body = (
+            "⚠️ 检测到疑似频繁断线或自动重连认证循环\n"
+            f"服务器：{server.display_name} ({server.server_id})\n"
+            f"玩家：{player_name}\n"
+            "该玩家的上线/下线动态已暂时屏蔽，聊天、死亡和成就消息不受影响。\n"
+        )
+        quiet_text = self._format_duration(
+            self.settings.reconnect_guard_quiet_seconds
+        )
+        if binding is not None:
+            await self._send_user_notice(
+                binding.matrix_id,
+                body
+                + "回到电脑并处理登录后，请在聊天室输入：#reconnect clear\n"
+                + f"若连续 {quiet_text} 没有新的上下线事件，保护也会自动解除。",
+                use_command_thread=False,
+            )
+            return
+        await self._send_room_content(
+            multiline_text_content(
+                body
+                + "该玩家尚未绑定 Matrix 账号，请管理员处理后输入："
+                + f"#reconnect clear {server.server_id} {player_name}\n"
+                + f"若连续 {quiet_text} 没有新的上下线事件，保护也会自动解除。"
+            ),
+            use_command_thread=False,
+        )
+
+    async def _reconnect_guard_cleanup_loop(self) -> None:
+        interval = min(60, self.settings.reconnect_guard_quiet_seconds)
+        while True:
+            await asyncio.sleep(interval)
+            expired = self.database.expire_reconnect_mutes(
+                self.settings.reconnect_guard_quiet_seconds
+            )
+            if expired:
+                LOGGER.info("自动解除 %d 项已静默的重连保护", expired)
 
     async def _send_online_player_response(
         self, server_id: str, payload: dict[str, Any], message_id: str
@@ -552,6 +1088,77 @@ class MatrixBridgeService:
                 f"• {player}" for player in players
             )
         request_id = str(payload.get("requestId", ""))
+        ping_item = self.ping_queries.pop(request_id, None)
+        if ping_item is not None:
+            expected_server_id, sent_at, future = ping_item
+            if expected_server_id == server_id and not future.done():
+                reported_pings: dict[str, int] = {}
+                raw_details = payload.get("playerDetails", [])
+                if isinstance(raw_details, list):
+                    for detail in raw_details:
+                        if not isinstance(detail, dict):
+                            continue
+                        name = detail.get("name")
+                        ping_ms = detail.get("pingMs")
+                        if isinstance(name, str) and isinstance(ping_ms, int) and not isinstance(ping_ms, bool):
+                            reported_pings[name.casefold()] = max(0, ping_ms)
+                def metric(name: str) -> float | None:
+                    value = payload.get(name)
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        number = float(value)
+                        if math.isfinite(number) and number >= 0:
+                            return number
+                    return None
+                future.set_result(PingSample(
+                    max(0, round((time.monotonic() - sent_at) * 1000)),
+                    online_count,
+                    tuple((name, reported_pings.get(name.casefold())) for name in players),
+                    metric("tps1m"),
+                    metric("mspt"),
+                ))
+            return
+        if request_id in self.expired_ping_queries:
+            self.expired_ping_queries.pop(request_id, None)
+            return
+        if request_id in self.expired_board_queries:
+            self.expired_board_queries.pop(request_id, None)
+            return
+        board_item = self.board_queries.pop(request_id, None)
+        if board_item is not None:
+            pending, expected_server_id = board_item
+            if expected_server_id == server_id:
+                board_players = []
+                raw_leaderboard = payload.get("leaderboardPlayers", [])
+                if isinstance(raw_leaderboard, list):
+                    for detail in raw_leaderboard:
+                        if not isinstance(detail, dict):
+                            continue
+                        name = detail.get("name")
+                        seconds = detail.get("totalPlaySeconds")
+                        online = detail.get("online")
+                        if (
+                            not isinstance(name, str) or not name.strip()
+                            or not isinstance(seconds, int) or isinstance(seconds, bool)
+                        ):
+                            continue
+                        avatar = self.database.get_player_avatar(name)
+                        board_players.append(BoardPlayer(
+                            name.strip(), max(0, seconds), online is True,
+                            avatar.local_path if avatar and avatar.local_path else None,
+                        ))
+                # Backward compatibility: old plugins can still produce a board,
+                # but their current player list is not mislabeled as cumulative time.
+                if not board_players:
+                    for name in players:
+                        avatar = self.database.get_player_avatar(name)
+                        board_players.append(BoardPlayer(
+                            name, None, True,
+                            avatar.local_path if avatar and avatar.local_path else None,
+                        ))
+                pending.results[server_id] = (online_count, tuple(board_players))
+                if pending.expected.issubset(pending.results):
+                    pending.complete.set()
+            return
         thread_item = self.online_query_threads.pop(request_id, None)
         thread_target = thread_item[0] if thread_item is not None else None
         await self._send_room_content(
@@ -760,7 +1367,17 @@ class MatrixBridgeService:
             return
         action = parts[1].casefold() if len(parts) > 1 else "help"
         if action in {"help", "帮助"}:
-            await self._send_user_notice(event.sender, self._server_command_help())
+            if len(parts) > 3:
+                await self._send_user_notice(
+                    event.sender,
+                    "用法：#server help [子命令]\n"
+                    "示例：#server help group",
+                )
+                return
+            topic = parts[2].casefold() if len(parts) == 3 else None
+            await self._send_user_notice(
+                event.sender, self._server_command_help(topic)
+            )
             return
         if action == "list":
             servers = self.database.all_servers()
@@ -851,6 +1468,12 @@ class MatrixBridgeService:
             "#help  查看本帮助",
             "#bind  获取游戏账号绑定验证码",
             "#list  查看已连接服务器的在线玩家",
+            "#online / #在线榜  生成各服累计游玩时长 PNG 榜单",
+            "#game help  查看跨聊天室和游戏内的小游戏玩法",
+            "#ping  实测机器人↔插件延迟、玩家 ping、TPS 与 MSPT",
+            "#reconnect status  查看自己的重连保护状态",
+            "#reconnect clear  处理登录后解除自己的上下线屏蔽",
+            "#reconnect help  查看重连保护说明",
         ]
         if role is not None:
             lines.extend(
@@ -866,7 +1489,11 @@ class MatrixBridgeService:
                     "#server group <id> <组>  修改路由组",
                     "#server enable|disable <id>  启用或禁用服务器",
                     "#server audit [id]  查看服务器管理审计",
-                    "#server help  查看服务器管理简表",
+                    "#server help [子命令]  查看服务器管理帮助或某项详细说明",
+                    "#avatar status  查看玩家头像显示模式",
+                    "#avatar on|off  开关实验性内嵌头像",
+                    "#reconnect list  查看被重连保护屏蔽的玩家",
+                    "#reconnect clear <服务器> <玩家>  管理员解除指定玩家",
                     "#admin list  查看机器人管理员名单",
                 ]
             )
@@ -883,6 +1510,316 @@ class MatrixBridgeService:
         elif role == "admin":
             lines.append("管理员增删仅限 owner 操作。")
         await self._send_user_notice(requester, "\n".join(lines))
+
+    async def _send_ping_status(self, requester: str) -> None:
+        servers = self.database.all_servers()
+        enabled_servers = [server for server in servers if server.enabled]
+        now = time.monotonic()
+        self.expired_ping_queries = {
+            request_id: expiry for request_id, expiry in self.expired_ping_queries.items()
+            if expiry > now
+        }
+        requests: dict[str, tuple[str, asyncio.Future[PingSample]]] = {}
+        try:
+            for server in enabled_servers:
+                websocket = self.servers.get(server.server_id)
+                if websocket is None:
+                    continue
+                request_id = str(uuid.uuid4())
+                future: asyncio.Future[PingSample] = asyncio.get_running_loop().create_future()
+                self.ping_queries[request_id] = (
+                    server.server_id, time.monotonic(), future,
+                )
+                requests[server.server_id] = (request_id, future)
+                await self._send_to_server(
+                    server.server_id, websocket, "query_list_request",
+                    {"requester": requester}, message_id=request_id,
+                )
+            if requests:
+                await asyncio.wait(
+                    [future for _, future in requests.values()],
+                    timeout=PING_QUERY_TIMEOUT_SECONDS,
+                )
+        finally:
+            for server_id, (request_id, future) in requests.items():
+                if not future.done():
+                    self.expired_ping_queries[request_id] = time.monotonic() + 120
+                self.ping_queries.pop(request_id, None)
+        connected_count = sum(
+            server.server_id in self.servers for server in enabled_servers
+        )
+        lines = [
+            "🏓 MatrixChatBridge 实时状态",
+            "机器人后台：正常",
+            "Matrix 连接：正常（本指令已实时收到并处理）",
+            f"WebSocket：监听端口 {self.settings.ws_port}，路径 /minecraft",
+            f"Minecraft：{connected_count}/{len(enabled_servers)} 台已启用服务器在线",
+            "延迟说明：机器人↔插件为本次查询往返耗时；玩家→服务器为游戏端报告的 ping",
+        ]
+        if not servers:
+            lines.append("• 尚未登记任何服务器")
+        else:
+            lines.append("【服务器连接】")
+            for server in servers:
+                if not server.enabled:
+                    state = "已禁用"
+                elif server.server_id in self.servers:
+                    state = "连接正常"
+                else:
+                    state = "连接异常或未连接"
+                lines.append(
+                    f"• {server.server_id} / {server.display_name} / {state} / "
+                    f"最后连接 {server.last_seen or '-'}"
+                )
+                item = requests.get(server.server_id)
+                if not server.enabled:
+                    lines.append("  机器人↔插件：已禁用；玩家→服务器：不可用")
+                elif item is None:
+                    lines.append("  机器人↔插件：未连接；玩家→服务器：不可用")
+                elif not item[1].done():
+                    lines.append(
+                        f"  机器人↔插件：查询超时（>{PING_QUERY_TIMEOUT_SECONDS * 1000:.0f} ms）；"
+                        "玩家→服务器：不可用"
+                    )
+                else:
+                    sample = item[1].result()
+                    lines.append(f"  机器人↔插件：{sample.round_trip_ms} ms")
+                    tps = f"{sample.tps_1m:.2f}" if sample.tps_1m is not None else "未提供"
+                    mspt = f"{sample.mspt:.2f} ms" if sample.mspt is not None else "未提供"
+                    lines.append(f"  服务器性能：TPS(1分钟) {tps} / MSPT {mspt}")
+                    if sample.online_count == 0:
+                        lines.append("  玩家→服务器：当前无人在线")
+                    elif not sample.players:
+                        lines.append("  玩家→服务器：插件未提供玩家列表")
+                    else:
+                        lines.append("  玩家→服务器：")
+                        for player_name, ping_ms in sample.players:
+                            value = f"{ping_ms} ms" if ping_ms is not None else "未提供"
+                            lines.append(f"    {player_name}：{value}")
+        await self._send_user_notice(requester, "\n".join(lines))
+
+    async def _handle_reconnect_command(
+        self, room: MatrixRoom, event: RoomMessageText, text: str
+    ) -> None:
+        try:
+            parts = shlex.split(text[1:])
+        except ValueError:
+            await self._send_user_notice(event.sender, "指令中的引号不完整。")
+            return
+        action = parts[1].casefold() if len(parts) > 1 else "help"
+        role = self._admin_role(room, event.sender)
+        self.database.expire_reconnect_mutes(
+            self.settings.reconnect_guard_quiet_seconds
+        )
+
+        if action in {"help", "帮助"} and len(parts) == 2:
+            await self._send_user_notice(
+                event.sender, self._reconnect_command_help(role is not None)
+            )
+            return
+        if action == "status" and len(parts) == 2:
+            bindings = self.database.get_bindings_by_matrix(event.sender)
+            if not bindings:
+                await self._send_user_notice(
+                    event.sender,
+                    "尚未绑定游戏账号。请先使用 #bind 获取验证码并在游戏内完成绑定。",
+                )
+                return
+            muted = self.database.all_reconnect_mutes()
+            lines: list[str] = []
+            for binding in bindings:
+                matches = [
+                    item for item in muted
+                    if item.player_id.casefold() == binding.player_id.casefold()
+                    and (
+                        binding.scope_id == "*"
+                        or item.server_id == binding.server_id
+                    )
+                ]
+                scope = "全部服务器" if binding.scope_id == "*" else binding.server_id
+                state = (
+                    "已屏蔽：" + ", ".join(item.server_id for item in matches)
+                    if matches else "正常"
+                )
+                lines.append(f"• {scope} / {binding.player_id} / {state}")
+            await self._send_user_notice(
+                event.sender,
+                "🔁 我的重连保护状态\n" + "\n".join(lines),
+            )
+            return
+        if action == "clear" and len(parts) == 2:
+            bindings = self.database.get_bindings_by_matrix(event.sender)
+            if not bindings:
+                await self._send_user_notice(
+                    event.sender,
+                    "尚未绑定游戏账号，无法确认需要解除的玩家。请联系管理员。",
+                )
+                return
+            removed = 0
+            for binding in bindings:
+                removed += self.database.clear_reconnect_mutes_for_binding(binding)
+                self._clear_reconnect_activity_for_binding(binding)
+            message = (
+                f"已解除 {removed} 项重连保护屏蔽，可以正常显示上下线动态。"
+                if removed
+                else "你的绑定账号当前没有被重连保护屏蔽。"
+            )
+            await self._send_user_notice(event.sender, message)
+            return
+        if action == "list" and len(parts) == 2:
+            if role is None:
+                await self._send_admin_denied(event.sender)
+                return
+            muted = self.database.all_reconnect_mutes()
+            lines = [
+                f"• {item.server_id} / {item.player_id} / 最近事件 {item.last_event_at}"
+                for item in muted
+            ] or ["• 当前没有被屏蔽的玩家"]
+            await self._send_user_notice(
+                event.sender,
+                "🔁 重连保护屏蔽列表\n" + "\n".join(lines),
+            )
+            return
+        if action == "clear" and len(parts) == 4:
+            if role is None:
+                await self._send_admin_denied(event.sender)
+                return
+            server_id, player_name = parts[2], parts[3]
+            removed = self.database.clear_reconnect_mute(
+                server_id, player_name
+            )
+            self.reconnect_activity.pop(
+                (server_id, player_name.casefold()), None
+            )
+            message = (
+                f"已解除 {server_id} / {player_name} 的重连保护屏蔽。"
+                if removed
+                else f"未找到 {server_id} / {player_name} 的重连保护记录。"
+            )
+            await self._send_user_notice(event.sender, message)
+            return
+        await self._send_user_notice(
+            event.sender, self._reconnect_command_help(role is not None)
+        )
+
+    def _clear_reconnect_activity_for_binding(self, binding: Binding) -> None:
+        for key in list(self.reconnect_activity):
+            server_id, player_id = key
+            if player_id != binding.player_id.casefold():
+                continue
+            if binding.scope_id == "*" or server_id == binding.server_id:
+                self.reconnect_activity.pop(key, None)
+
+    def _reconnect_command_help(self, is_admin: bool) -> str:
+        quiet_text = self._format_duration(
+            self.settings.reconnect_guard_quiet_seconds
+        )
+        lines = [
+            "🔁 自动重连保护",
+            "机器人会检测两类异常：短时间内多次快速上线后下线，以及反复上线后约两分钟未认证被踢出。",
+            "默认在 60 秒内出现 3 次不超过 30 秒的短会话，或在 10 分钟内出现 2 次 60～180 秒的认证超时会话时触发。",
+            "聊天、死亡、成就和账号绑定不受影响。",
+            f"屏蔽期间连续 {quiet_text} 没有新的上下线事件时会自动解除。",
+            "",
+            "【玩家指令】",
+            "#reconnect status  查看自己绑定账号的保护状态",
+            "#reconnect clear  回到电脑并处理登录后解除自己的屏蔽",
+            "#reconnect help  查看本说明",
+        ]
+        if is_admin:
+            lines.extend(
+                [
+                    "",
+                    "【管理员指令】",
+                    "#reconnect list  查看所有被屏蔽玩家",
+                    "#reconnect clear <服务器> <玩家>  解除指定玩家的屏蔽",
+                    "示例：#reconnect clear vanilla Steve",
+                ]
+            )
+        lines.extend(
+            [
+                "",
+                "【注意】",
+                "解除前应先确认玩家已经回到电脑并完成密码认证，否则自动重连循环可能再次触发保护。",
+            ]
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_duration(seconds: int) -> str:
+        if seconds % 60 == 0:
+            return f"{seconds // 60} 分钟"
+        return f"{seconds} 秒"
+
+    async def _handle_avatar_command(
+        self, room: MatrixRoom, event: RoomMessageText, text: str
+    ) -> None:
+        if self._admin_role(room, event.sender) is None:
+            await self._send_admin_denied(event.sender)
+            return
+        try:
+            parts = shlex.split(text[1:])
+        except ValueError:
+            await self._send_user_notice(event.sender, "指令中的引号不完整。")
+            return
+        action = parts[1].casefold() if len(parts) > 1 else "status"
+        if (action in {"status", "状态"} and len(parts) == 2) or len(parts) == 1:
+            await self._send_avatar_status(event.sender)
+            return
+        if action not in {"on", "off"} or len(parts) != 2:
+            await self._send_user_notice(
+                event.sender,
+                "🖼️ 玩家头像实验功能\n"
+                "#avatar status  查看当前状态\n"
+                "#avatar on  开启实验性内嵌头像\n"
+                "#avatar off  关闭并使用跨客户端兼容文本",
+            )
+            return
+        if action == "on" and not self.settings.avatar_enabled:
+            await self._send_user_notice(
+                event.sender,
+                "头像功能已被服务器环境变量 AVATAR_ENABLED=false 禁用。",
+            )
+            return
+
+        async with self.avatar_mode_lock:
+            requested_mode = "emote" if action == "on" else "text"
+            if self.avatar_display_mode == requested_mode:
+                await self._send_avatar_status(event.sender)
+                return
+            if requested_mode == "emote":
+                await self.avatar_manager.start()
+                self.avatar_display_mode = "emote"
+            else:
+                self.avatar_display_mode = "text"
+                await self.avatar_manager.close()
+            self.database.set_setting("avatar_display_mode", requested_mode)
+
+        if requested_mode == "emote":
+            await self._send_user_notice(
+                event.sender,
+                "已开启实验性玩家头像。支持 Matrix 自定义表情的客户端会显示头像；"
+                "部分 Element X 版本仍可能显示降级文字。设置已持久保存。",
+            )
+        else:
+            await self._send_user_notice(
+                event.sender,
+                "已关闭实验性玩家头像，恢复跨客户端兼容文本。设置已持久保存。",
+            )
+
+    async def _send_avatar_status(self, requester: str) -> None:
+        if not self.settings.avatar_enabled:
+            status = "不可用（AVATAR_ENABLED=false）"
+        elif self._avatar_emotes_enabled():
+            status = "开启（实验性自定义表情模式）"
+        else:
+            status = "关闭（跨客户端兼容文本模式）"
+        await self._send_user_notice(
+            requester,
+            "🖼️ 玩家头像显示\n"
+            f"状态：{status}\n"
+            "切换：#avatar on 或 #avatar off",
+        )
 
     async def _handle_admin_command(
         self, room: MatrixRoom, event: RoomMessageText, text: str
@@ -987,21 +1924,134 @@ class MatrixBridgeService:
         await self._send_user_notice(requester, body)
 
     @staticmethod
-    def _server_command_help() -> str:
-        return (
+    def _server_command_help(topic: str | None = None) -> str:
+        overview = (
             "🖥️ 服务器管理指令\n"
+            "# 与 ! 前缀等价；<参数> 必填，[参数] 可选。\n"
             "【查询】\n"
-            "!server list  查看服务器列表\n"
-            "!server info <id>  查看服务器详情\n"
+            "#server list  查看全部已登记服务器\n"
+            "#server info <id>  查看单台服务器详情\n"
+            "#server audit [id]  查看全部或指定服务器的管理审计\n"
             "【修改】\n"
-            "!server rename <id> <名称>  覆盖显示名称\n"
-            "!server reset-name <id>  恢复插件端名称\n"
-            "!server port <id> <端口>  覆盖展示端口\n"
-            "!server reset-port <id>  恢复插件端端口\n"
-            "!server group <id> <组>  修改路由组\n"
-            "!server enable <id>  启用服务器\n"
-            "!server disable <id>  禁用服务器\n"
-            "!server audit [id]  查看服务器管理审计"
+            "#server rename <id> <名称>  覆盖聊天室显示名称\n"
+            "#server reset-name <id>  恢复插件上报的名称\n"
+            "#server port <id> <端口>  覆盖展示用游戏端口\n"
+            "#server reset-port <id>  恢复插件上报的端口\n"
+            "#server group <id> <组>  修改跨服聊天路由组\n"
+            "#server enable <id>  启用服务器\n"
+            "#server disable <id>  禁用服务器\n"
+            "【详细帮助】\n"
+            "#server help <子命令>  查看用途、参数、原理、示例和注意事项\n"
+            "可查询：list、info、audit、rename、reset-name、port、"
+            "reset-port、group、enable、disable\n"
+            "示例：#server help group"
+        )
+        if topic is None:
+            return overview
+
+        aliases = {"status": "info", "帮助": "help"}
+        topic = aliases.get(topic, topic)
+        details = {
+            "list": (
+                "🖥️ server list 详细帮助\n"
+                "【用途】\n列出机器人数据库中已经登记的所有 Minecraft 服务器。\n"
+                "【语法】\n#server list  显示服务器列表\n"
+                "【输出字段】\n"
+                "依次显示 server-id、显示名称、路由组、游戏端口、连接状态和启用状态。\n"
+                "【状态区别】\n"
+                "在线/离线表示插件当前是否连接机器人；启用/禁用表示机器人是否允许该服务器参与转发。\n"
+                "【注意】\n服务器离线不代表已被禁用，两者含义不同。"
+            ),
+            "info": (
+                "🖥️ server info 详细帮助\n"
+                "【用途】\n查看一台服务器的完整登记信息和当前状态。\n"
+                "【语法】\n#server info <id>  查看指定服务器\n"
+                "【参数】\nid：插件配置中的唯一 server-id，不是显示名称。\n"
+                "【示例】\n#server info vanilla  查看 vanilla 的详情\n"
+                "【输出说明】\n"
+                "显示名称可能是管理员覆盖值；插件名称和插件端口是服务器最近一次握手上报的值。"
+            ),
+            "audit": (
+                "📋 server audit 详细帮助\n"
+                "【用途】\n查询服务器名称、端口、路由组及启用状态的管理修改记录。\n"
+                "【语法】\n"
+                "#server audit  查看所有服务器最近的审计记录\n"
+                "#server audit <id>  只查看指定服务器\n"
+                "【示例】\n#server audit survival  查看 survival 的修改记录\n"
+                "【输出字段】\n时间、操作者 Matrix ID、server-id、动作、旧值和新值。"
+            ),
+            "rename": (
+                "✏️ server rename 详细帮助\n"
+                "【用途】\n覆盖服务器在聊天室和跨服消息中显示的名称。\n"
+                "【语法】\n#server rename <id> <名称>  设置显示名称\n"
+                "【参数】\nid：唯一 server-id；名称：允许包含空格。\n"
+                "【示例】\n#server rename vanilla 1.21 主服  显示为“1.21 主服”\n"
+                "【工作原理】\n只改变机器人数据库中的显示覆盖值，不修改插件 config.yml，也不改变 server-id。\n"
+                "【撤销】\n使用 #server reset-name <id> 恢复插件上报名称。"
+            ),
+            "reset-name": (
+                "↩️ server reset-name 详细帮助\n"
+                "【用途】\n删除管理员设置的名称覆盖，重新采用插件上报的服务器名称。\n"
+                "【语法】\n#server reset-name <id>  恢复插件端名称\n"
+                "【示例】\n#server reset-name vanilla  取消 vanilla 的名称覆盖\n"
+                "【注意】\n不会修改插件配置；插件下次重连或握手后仍会继续更新其上报名称。"
+            ),
+            "port": (
+                "🔌 server port 详细帮助\n"
+                "【用途】\n覆盖机器人展示给管理员看的 Minecraft 游戏端口。\n"
+                "【语法】\n#server port <id> <端口>  设置展示端口\n"
+                "【参数】\n端口必须是 1 到 65535 的整数。\n"
+                "【示例】\n#server port survival 25566  将展示端口设为 25566\n"
+                "【工作原理】\n这是元数据覆盖，不会修改 server.properties，不会打开防火墙端口，也不会改变插件连接机器人的 WebSocket 端口。\n"
+                "【撤销】\n使用 #server reset-port <id> 恢复插件上报端口。"
+            ),
+            "reset-port": (
+                "↩️ server reset-port 详细帮助\n"
+                "【用途】\n删除管理员设置的端口覆盖，重新显示插件最近上报的游戏端口。\n"
+                "【语法】\n#server reset-port <id>  恢复插件端口\n"
+                "【示例】\n#server reset-port survival  取消 survival 的端口覆盖\n"
+                "【注意】\n本指令不会重启服务器，也不会修改任何网络监听。"
+            ),
+            "group": (
+                "🔀 server group 详细帮助\n"
+                "【用途】\n决定哪些 Minecraft 服务器属于同一个跨服聊天转发范围。\n"
+                "【语法】\n#server group <id> <组>  修改服务器的路由组\n"
+                "【参数】\n"
+                "id：要修改的唯一 server-id。\n"
+                "组：1 到 64 位，只能使用英文字母、数字、下划线、点和连字符。\n"
+                "【工作原理】\n"
+                "同组服务器会互相收到真实玩家聊天；来源服不会收到自己的回传消息。不同组之间不会跨服转发。\n"
+                "只有与 MATRIX_RELAY_GROUP 相同的组会把 Minecraft 消息发送到当前 Matrix 房间，并接收该房间消息。\n"
+                "【示例】\n"
+                "#server group vanilla main  将 vanilla 加入 main 组\n"
+                "#server group minigame games  将 minigame 隔离到 games 组\n"
+                "【注意】\n"
+                "修改立即写入数据库并影响后续消息，无需重启；不会自动修改插件 config.yml 中的 relay-group，配置不一致时日志会给出警告。"
+            ),
+            "enable": (
+                "✅ server enable 详细帮助\n"
+                "【用途】\n允许已登记服务器连接后参与 Matrix 与跨服消息转发。\n"
+                "【语法】\n#server enable <id>  启用服务器\n"
+                "【示例】\n#server enable creative  启用 creative\n"
+                "【注意】\n启用不会启动 Minecraft 进程；服务器插件仍需正常运行并使用正确 token 连接。"
+            ),
+            "disable": (
+                "⛔ server disable 详细帮助\n"
+                "【用途】\n阻止指定服务器继续参与机器人消息处理和跨服转发。\n"
+                "【语法】\n#server disable <id>  禁用服务器\n"
+                "【示例】\n#server disable creative  禁用 creative\n"
+                "【影响】\n后续来自该服务器的玩家事件不会被转发；它也不会再作为跨服消息目标。\n"
+                "【注意】\n不会关闭 Minecraft 服务器进程，也不会删除服务器、token、绑定或审计数据。"
+            ),
+        }
+        detail = details.get(topic)
+        if detail is not None:
+            return detail
+        return (
+            f"未知的 server 子命令：{topic}\n"
+            "可查询：list、info、audit、rename、reset-name、port、"
+            "reset-port、group、enable、disable\n"
+            "示例：#server help group"
         )
 
     @staticmethod

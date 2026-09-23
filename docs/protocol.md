@@ -74,6 +74,17 @@ excluded. Backend-originated broadcasts do not synthesize this event.
 
 `bind_confirm` contains `token`, `playerId`, and `playerUuid`.
 `query_list_response` contains `onlineCount`, `playerList`, and `requestId`.
+Newer plugins also include `playerDetails`, an array of
+`{"name": "Steve", "onlineSeconds": 3600, "pingMs": 42}` entries, plus
+`tps1m` and `mspt` numeric fields. `onlineSeconds` is the current session
+duration as known by the plugin; it restarts if the plugin is reloaded.
+These extra fields are optional so older plugins keep working; the bot uses
+the same request/response pair for `#list`, `#online`, and `#ping`.
+When a request contains `includeLeaderboard: true`, a newer plugin additionally
+returns `leaderboardPlayers` entries with `name`, persistent
+`totalPlaySeconds`, and current `online` state. The value is derived from the
+server's `PLAY_ONE_MINUTE` player statistic. `leaderboardTotal` reports the
+number of known ranked players and `leaderboardLimit` reports the response cap.
 
 ## 5. Backend to plugin
 
@@ -83,6 +94,14 @@ mentioned Matrix users to the appropriate game identity before sending.
 
 `query_list_request` contains `requester`. `bind_result` contains `playerId`,
 `playerUuid`, `success`, and `message`.
+
+Before a normal Minecraft server shutdown, a newer plugin sends the
+`server_stopping` control message with `reason: "server_stopping"`. The backend
+uses this signal to distinguish an intentional stop/restart from an unexpected
+WebSocket outage. It announces the stop once and announces successful restart
+after the same authenticated server ID reconnects and sends `hello`. Abrupt
+process termination, host power loss, and network failure cannot send this
+signal and continue through the delayed health-alert path.
 
 ### Structured cross-server relay
 

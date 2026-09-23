@@ -1,7 +1,7 @@
 # MatrixChatBridge 跨 VPS 与多服务端部署指南
 
 本文面向机器人后端迁移到独立 VPS、同一台 Minecraft 主机运行多个服务端的
-场景，适用于当前 0.4.0 协议。
+场景，适用于当前 0.4.9（协议 v2）。
 
 有关不同 Minecraft 版本及 Paper、Fabric、Forge/NeoForge 的插件端适配路线，
 参见 [多平台与多版本适配规划](多平台与多版本适配规划.md)。
@@ -35,7 +35,7 @@
 | 端口 | 示例 | 用途 | 是否每个 Minecraft 服务端独立 |
 | --- | ---: | --- | --- |
 | Minecraft 游戏端口 | 25565、25566 | 玩家连接游戏 | 是，同一 IP 上不能重复 |
-| 后端内部 WebSocket 端口 | 8765 | 机器人接收所有插件连接 | 否，所有插件共用一个 |
+| 后端内部 WebSocket 端口 | 8766 | 机器人接收所有插件连接 | 否，所有插件共用一个 |
 | 公网 TLS 端口 | 443 | 插件通过 `wss://` 连接机器人 VPS | 否，所有插件共用一个 |
 
 插件不是监听服务器，而是 WebSocket 客户端。因此，一台机器上即使运行十个
@@ -56,13 +56,13 @@ Minecraft 主机 A
                                       ▼
                            机器人 VPS 公网 :443
                            ├─ Caddy/Nginx（TLS）
-                           └─ 127.0.0.1:8765
+                           └─ 127.0.0.1:8766
                                       │
                                       ▼
                               Matrix Homeserver :443
 ```
 
-VPS 防火墙只需允许公网访问 SSH 管理端口和 TCP 443。`8765` 应继续绑定
+VPS 防火墙只需允许公网访问 SSH 管理端口和 TCP 443。`8766` 应继续绑定
 `127.0.0.1`，只允许同机反向代理访问。
 
 Minecraft 主机通常只需要允许到机器人域名 TCP 443 的出站连接，不需要为了
@@ -127,7 +127,7 @@ TCP 443，也使用相同方式连接。
 不要在公网使用：
 
 ```text
-ws://机器人公网IP:8765/minecraft
+ws://机器人公网IP:8766/minecraft
 ```
 
 明文 `ws://` 会暴露聊天内容、服务器 ID 和 Bearer token。推荐地址是：
@@ -148,17 +148,17 @@ services:
   matrix-serverchat:
     environment:
       WS_HOST: "0.0.0.0"
-      WS_PORT: "8765"
+      WS_PORT: "8766"
     ports:
-      - "127.0.0.1:8765:8765"
+      - "127.0.0.1:8766:8766"
 ```
 
-容器内部监听 `0.0.0.0:8765`，但宿主机只发布到
-`127.0.0.1:8765`。不要改成 `0.0.0.0:8765:8765`，也不需要为每个插件
+容器内部监听 `0.0.0.0:8766`，但宿主机只发布到
+`127.0.0.1:8766`。不要改成 `0.0.0.0:8766:8766`，也不需要为每个插件
 增加一个 Docker 端口映射。
 
 如果同一台 VPS 将来运行多个完全独立的机器人后端实例，每个实例才需要不同的
-宿主机内部端口，例如 8765、8766；单个后端管理多台 Minecraft 服不需要这样做。
+宿主机内部端口，例如 8766、8767；单个后端管理多台 Minecraft 服不需要这样做。
 
 ## 7. 使用 Caddy 提供 WSS
 
@@ -167,7 +167,7 @@ Caddy 配置较短，并能自动申请和续期证书。示例 `Caddyfile`：
 ```caddyfile
 bridge.example.com {
     handle /minecraft {
-        reverse_proxy 127.0.0.1:8765
+        reverse_proxy 127.0.0.1:8766
     }
 
     handle {
@@ -180,7 +180,7 @@ bridge.example.com {
 
 1. 将 `bridge.example.com` 的 A/AAAA 记录指向机器人 VPS；
 2. 放行 VPS 的 TCP 80 和 443，证书申请成功后可以按需要限制 80；
-3. 确认 8765 仍只绑定环回地址；
+3. 确认 8766 仍只绑定环回地址；
 4. 让 Caddy 加载配置并检查日志。
 
 Caddy 会自动处理 WebSocket 升级。反向代理会保留插件发送的 Authorization 和
@@ -210,7 +210,7 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/bridge.example.com/privkey.pem;
 
     location = /minecraft {
-        proxy_pass http://127.0.0.1:8765;
+        proxy_pass http://127.0.0.1:8766;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
@@ -235,7 +235,7 @@ server {
 建议规则：
 
 - 机器人 VPS：允许 TCP 443；SSH 只开放实际管理端口并尽量限制来源；
-- 机器人 VPS：不允许公网直接访问 TCP 8765；
+- 机器人 VPS：不允许公网直接访问 TCP 8766；
 - Minecraft 主机：允许到机器人域名 TCP 443 的出站连接；
 - Matrix Homeserver：机器人 VPS 能访问其 HTTPS 443；
 - 若配置 IPv6 AAAA 记录，必须同时正确配置 IPv6 防火墙和 TLS；否则先只配置 A
@@ -278,13 +278,13 @@ docker compose ps
 docker compose logs --tail=200 matrix-serverchat
 ```
 
-确认 8765 没有暴露到所有网卡：
+确认 8766 没有暴露到所有网卡：
 
 ```bash
-ss -lntp | grep 8765
+ss -lntp | grep 8766
 ```
 
-预期宿主机地址为 `127.0.0.1:8765`。直接用浏览器打开 `/minecraft` 出现错误并
+预期宿主机地址为 `127.0.0.1:8766`。直接用浏览器打开 `/minecraft` 出现错误并
 不代表故障，因为普通 HTTP 请求没有执行 WebSocket 握手，也没有携带插件认证
 头。
 
@@ -294,7 +294,7 @@ ss -lntp | grep 8765
 | --- | --- |
 | TLS 证书错误 | 域名、系统时间、证书链、AAAA 记录 |
 | HTTP 404 | 插件 URL 是否包含 `/minecraft` |
-| HTTP 502 | 后端容器是否运行，代理能否访问 127.0.0.1:8765 |
+| HTTP 502 | 后端容器是否运行，代理能否访问 127.0.0.1:8766 |
 | WebSocket 4001 | server-id、token、服务器 enabled 状态 |
 | WebSocket 4003 | server-id 字符格式是否合法 |
 | WebSocket 4004 | 请求路径不是 `/minecraft` |
@@ -339,7 +339,7 @@ HTTP 版本仍应具备：
 - [ ] 域名只指向正确的新 VPS；
 - [ ] TLS 证书有效且自动续期；
 - [ ] 插件使用 `wss://域名/minecraft`；
-- [ ] 8765 只绑定 `127.0.0.1`；
+- [ ] 8766 只绑定 `127.0.0.1`；
 - [ ] 每台服的 server-id 和 token 均不同；
 - [ ] 同机 Minecraft 游戏端口不重复；
 - [ ] 数据库、Matrix 密码和管理员身份已迁移；

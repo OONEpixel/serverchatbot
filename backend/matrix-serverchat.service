@@ -1,0 +1,23 @@
+[Unit]
+Description=Matrix ServerChat backend (Docker Compose)
+Documentation=https://github.com/OONEpixel/serverchatbot
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/matrix-serverchat
+ExecStartPre=/usr/bin/docker compose config --quiet
+ExecStart=/usr/bin/docker compose up -d --no-build matrix-serverchat
+ExecReload=/usr/bin/docker compose up -d --no-build --force-recreate matrix-serverchat
+ExecStop=/usr/bin/docker compose stop -t 30 matrix-serverchat
+TimeoutStartSec=0
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

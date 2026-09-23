@@ -2,7 +2,7 @@
 # processes are on the same machine.
 bridge:
   enabled: true
-  url: "ws://127.0.0.1:8765/minecraft"
+  url: "ws://127.0.0.1:8766/minecraft"
   server-id: "survival"
   server-name: "生存服"
   relay-group: "main"

@@ -18,21 +18,28 @@ def _avatar_html(player_name: str, avatar_mxc_uri: str | None) -> str:
     if not re.fullmatch(r"mxc://[^\s/]+/[^\s/]+", avatar_mxc_uri):
         return ""
     return (
-        f'<img src="{html.escape(avatar_mxc_uri, quote=True)}" '
-        f'width="24" height="24" alt="[{html.escape(player_name)}头像]" '
+        f'<img data-mx-emoticon src="{html.escape(avatar_mxc_uri, quote=True)}" '
+        f'height="24" alt="{html.escape(player_name)}头像" '
         f'title="{html.escape(player_name)}"> '
     )
 
 
 def avatar_message_content(
-    body: str, player_name: str, avatar_mxc_uri: str | None
+    body: str,
+    player_name: str,
+    avatar_mxc_uri: str | None,
+    avatar_display_mode: str = "text",
 ) -> dict[str, object]:
     content: dict[str, object] = {
         "msgtype": "m.text",
         "body": body,
         "m.mentions": {},
     }
-    avatar_html = _avatar_html(player_name, avatar_mxc_uri)
+    avatar_html = (
+        _avatar_html(player_name, avatar_mxc_uri)
+        if avatar_display_mode == "emote"
+        else ""
+    )
     if avatar_html:
         content["format"] = "org.matrix.custom.html"
         content["formatted_body"] = avatar_html + html.escape(body)
@@ -45,11 +52,16 @@ def game_chat_content(
     message: str,
     targets: list[MentionTarget],
     avatar_mxc_uri: str | None = None,
+    avatar_display_mode: str = "text",
 ) -> dict[str, object]:
     prefix = f"[{server_name}]<{player_name}> "
     body = prefix + message
     by_reference = {target.reference.casefold(): target for target in targets}
-    avatar_html = _avatar_html(player_name, avatar_mxc_uri)
+    avatar_html = (
+        _avatar_html(player_name, avatar_mxc_uri)
+        if avatar_display_mode == "emote"
+        else ""
+    )
     if not by_reference and not avatar_html:
         return {"msgtype": "m.text", "body": body, "m.mentions": {}}
 

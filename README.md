@@ -1,6 +1,6 @@
 # MatrixChatBridge
 
-管理与运维请参阅 [管理员操作手册 0.4.0](docs/管理员操作手册-0.4.0.md)。
+管理与运维请参阅 [管理员操作手册 0.4.9](docs/管理员操作手册-0.4.9.md)。
 跨机器部署及一机多服请参阅
 [跨 VPS 与多服务端部署指南](docs/跨VPS与多服务端部署指南.md)。
 多 Minecraft 服务端接入以及 Paper、Fabric、Forge/NeoForge 的演进路线参阅
@@ -25,9 +25,11 @@ MatrixChatBridge ── WebSocket + JSON ──► Matrix bot backend ──► 
       └─ matrix_message ┘     └─ relay_message ─► 同组的其他服务器
 ```
 
-插件是 **WebSocket 客户端**，机器人后台是 **WebSocket 服务端**。同机部署可只监听 `127.0.0.1:8765`；跨机器必须通过 TLS 反向代理使用 `wss://`。WebSocket 提供全双工长连接，不需要插件开放额外端口。
+插件是 **WebSocket 客户端**，机器人后台是 **WebSocket 服务端**。同机部署可只监听 `127.0.0.1:8766`；跨机器必须通过 TLS 反向代理使用 `wss://`。WebSocket 提供全双工长连接，不需要插件开放额外端口。
 
-消息协议使用 JSON，0.4.0 对应 `v: 2`。事件有全局 UUID，双方通过 `ack` 确认；掉线期间插件最多在内存中保存 `max-pending-events` 条未确认事件，重连后重发。完整协议见 [docs/protocol.md](docs/protocol.md)。
+可信局域网可使用内网 `ws://` 地址；跨公网或不可信网络必须通过 TLS 反向代理使用 `wss://`。
+
+消息协议使用 JSON，0.4.9 对应 `v: 2`。事件有全局 UUID，双方通过 `ack` 确认；掉线期间插件最多在内存中保存 `max-pending-events` 条未确认事件，重连后重发。完整协议见 [docs/protocol.md](docs/protocol.md)。
 
 ## 已实现
 
@@ -37,6 +39,11 @@ MatrixChatBridge ── WebSocket + JSON ──► Matrix bot backend ──► 
 - 会在游戏聊天中公告的进度/成就；配方解锁和隐藏进度不会产生噪声
 - Matrix 房间纯文本消息广播到游戏
 - Matrix `!list` 或 `#list` 查询各 Minecraft 服务器的在线人数和玩家列表
+- Matrix `#online` 或 `#在线榜` 查询各已登记服务器并生成 PNG 在线榜（离线/超时也会标出）
+- Matrix `#ping` 实测机器人与插件的查询往返耗时，并显示玩家 ping、TPS 与 MSPT
+- 正常关闭或重启游戏服时主动通报，完成重新握手后提示重启成功；异常掉线仍走防抖告警
+- 在线榜按服务器分组，以缓存皮肤头像、游戏 ID、累计游玩时长和当前在线状态展示历史玩家；统计由新版插件回传并随玩家数据持久保存
+- Matrix 与游戏聊天均可用 `#game` 参与同组小游戏：掷骰子、抛硬币、限时猜数字
 - Matrix `!bind` 或 `#bind` 生成验证码后，玩家可用 `/matrixbind <验证码>` 或 `/bind <验证码>` 完成绑定
 - 每台服务器独立的 256 位 Bearer Token；后台只保存哈希
 - 按 `relay-group` 跨服转发结构化玩家聊天，来源排除、全局去重且最多一跳
@@ -52,7 +59,7 @@ MatrixChatBridge ── WebSocket + JSON ──► Matrix bot backend ──► 
 .\gradlew.bat clean test shadowJar
 ```
 
-产物位于 `build/libs/matrix-chat-bridge-0.4.0.jar`。项目使用 Java 21 toolchain；运行 Minecraft 1.21.x 的 Leaf 也至少需要 Java 21。
+产物位于 `build/libs/matrix-chat-bridge-0.4.9.jar`。项目使用 Java 21 toolchain；运行 Minecraft 1.21.x 的 Leaf 也至少需要 Java 21。
 
 ## 本地部署参数
 
@@ -72,7 +79,7 @@ Copy-Item .\deploy.local.example.psd1 .\deploy.local.psd1
 2. 启动一次服务器，让插件生成 `plugins/MatrixChatBridge/config.yml`。
 3. 在游戏 OP 或服务器控制台执行 `/matrixbridge token generate`，插件会生成并自动保存独立 token。
 4. 在后台执行带 `--prompt-token` 的 `app.admin add-server`，通过隐藏输入粘贴该 token。
-5. 确认后台监听 `ws://127.0.0.1:8765/minecraft`，或修改插件的 `bridge.url`。
+5. 确认后台监听 `ws://127.0.0.1:8766/minecraft`，或修改插件的 `bridge.url`。
 6. 用 `/matrixbridge status` 检查连接。
 
 ## 绑定与在线查询

@@ -26,6 +26,7 @@ public final class ServerEventListener implements Listener {
 
     @EventHandler(priority = EventPriority.MONITOR)
     public void onPlayerJoin(PlayerJoinEvent event) {
+        plugin.notePlayerJoin(event.getPlayer());
         if (!plugin.bridgeConfig().events().playerJoin()) {
             return;
         }
@@ -36,6 +37,7 @@ public final class ServerEventListener implements Listener {
 
     @EventHandler(priority = EventPriority.MONITOR)
     public void onPlayerQuit(PlayerQuitEvent event) {
+        plugin.notePlayerQuit(event.getPlayer());
         if (!plugin.bridgeConfig().events().playerQuit()) {
             return;
         }

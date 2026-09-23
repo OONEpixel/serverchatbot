@@ -48,7 +48,7 @@ class AvatarManager:
         self.avatar_directory.mkdir(parents=True, exist_ok=True)
         self._session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=self.lookup_timeout_seconds),
-            headers={"User-Agent": "MatrixChatBridge/0.4.0"},
+            headers={"User-Agent": "MatrixChatBridge/0.4.9"},
         )
         await self._ensure_default_avatar()
         self._weekly_task = asyncio.create_task(

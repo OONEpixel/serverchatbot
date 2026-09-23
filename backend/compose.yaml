@@ -9,7 +9,7 @@ services:
       MATRIX_PASSWORD_FILE: "/run/secrets/matrix_password"
       ROOM_ID: "${ROOM_ID:?Set ROOM_ID in backend/.env}"
       WS_HOST: "0.0.0.0"
-      WS_PORT: "8765"
+      WS_PORT: "8766"
       DATABASE_PATH: "/data/bridge.db"
       MAX_MATRIX_MESSAGE_LENGTH: "256"
       BIND_TOKEN_TTL_SECONDS: "600"
@@ -22,10 +22,28 @@ services:
       ADMIN_POWER_LEVEL: "50"
       # 玩家头像：本地缓存并在每周日北京时间 00:00 刷新。
       AVATAR_ENABLED: "true"
+      # text：全客户端干净显示；emote：支持 Matrix 自定义表情的客户端显示头像
+      AVATAR_DISPLAY_MODE: "text"
       AVATAR_DIRECTORY: "/data/avatars"
       AVATAR_LOOKUP_TIMEOUT_SECONDS: "8"
+      # 自动重连保护：两次 60-180 秒的短会话出现在 10 分钟窗口内即屏蔽上下线动态。
+      RECONNECT_GUARD_ENABLED: "true"
+      RECONNECT_GUARD_WINDOW_SECONDS: "600"
+      RECONNECT_GUARD_MIN_SESSION_SECONDS: "60"
+      RECONNECT_GUARD_MAX_SESSION_SECONDS: "180"
+      RECONNECT_GUARD_THRESHOLD: "2"
+      # 快速抖动：60 秒内出现 3 次不超过 30 秒的会话即触发。
+      RECONNECT_GUARD_RAPID_WINDOW_SECONDS: "60"
+      RECONNECT_GUARD_RAPID_MAX_SESSION_SECONDS: "30"
+      RECONNECT_GUARD_RAPID_THRESHOLD: "3"
+      # 屏蔽后连续 15 分钟没有新上下线事件则自动解除。
+      RECONNECT_GUARD_QUIET_SECONDS: "900"
+      # 插件连接持续异常 30 秒才通知；同一服务器的状态消息至少间隔 60 秒。
+      SERVER_HEALTH_ENABLED: "true"
+      SERVER_HEALTH_GRACE_SECONDS: "30"
+      SERVER_HEALTH_MIN_NOTICE_INTERVAL_SECONDS: "60"
     ports:
-      - "127.0.0.1:8765:8765"
+      - "127.0.0.1:8766:8766"
     volumes:
       - ./data:/data
     secrets:

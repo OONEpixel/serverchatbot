@@ -2,6 +2,7 @@ import hashlib
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app.database import Database
@@ -144,6 +145,38 @@ class DatabaseTest(unittest.TestCase):
             self.assertEqual(
                 "a" * 64, reopened.get_player_avatar("STEVE").texture_hash
             )
+            reopened.close()
+
+    def test_reconnect_mute_is_persistent_and_case_insensitive(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bridge.db"
+            database = Database(path)
+            self.assertTrue(database.mute_reconnect_player("vanilla", "Steve"))
+            self.assertFalse(database.mute_reconnect_player("vanilla", "steve"))
+            database.close()
+
+            reopened = Database(path)
+            self.assertTrue(reopened.is_reconnect_muted("vanilla", "STEVE"))
+            self.assertEqual(1, len(reopened.all_reconnect_mutes()))
+            base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            reopened._connection.execute(
+                "UPDATE reconnect_mutes SET last_event_at = ?",
+                (base.isoformat(),),
+            )
+            reopened._connection.commit()
+            self.assertTrue(
+                reopened.refresh_reconnect_mute(
+                    "vanilla", "Steve", 900, base + timedelta(seconds=899)
+                )
+            )
+            self.assertFalse(
+                reopened.refresh_reconnect_mute(
+                    "vanilla", "Steve", 900, base + timedelta(seconds=1800)
+                )
+            )
+            reopened.mute_reconnect_player("vanilla", "Steve")
+            self.assertTrue(reopened.clear_reconnect_mute("vanilla", "steve"))
+            self.assertFalse(reopened.is_reconnect_muted("vanilla", "Steve"))
             reopened.close()
 
 

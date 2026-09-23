@@ -364,15 +364,34 @@ public final class WebSocketBridge implements AutoCloseable {
 
     @Override
     public void close() {
+        close(false);
+    }
+
+    public void close(boolean serverStopping) {
         stopping = true;
         WebSocket current = socket.getAndSet(null);
         if (current != null) {
-            current.sendClose(WebSocket.NORMAL_CLOSURE, "plugin disabled")
-                    .orTimeout(2, TimeUnit.SECONDS)
-                    .exceptionally(error -> {
-                        current.abort();
-                        return null;
-                    });
+            try {
+                CompletableFuture<WebSocket> closing;
+                if (serverStopping) {
+                    JsonObject payload = new JsonObject();
+                    payload.addProperty("reason", "server_stopping");
+                    payload.addProperty("minecraftVersion", plugin.getServer().getMinecraftVersion());
+                    String json = codec.encode(codec.create(
+                            "server_stopping", config.serverId(), payload));
+                    closing = current.sendText(json, true)
+                            .thenCompose(ignored -> current.sendClose(
+                                    WebSocket.NORMAL_CLOSURE, "server stopping"));
+                } else {
+                    closing = current.sendClose(
+                            WebSocket.NORMAL_CLOSURE, "plugin disabled");
+                }
+                closing.get(1500, TimeUnit.MILLISECONDS);
+            } catch (Exception error) {
+                current.abort();
+                plugin.getLogger().warning(
+                        "关闭机器人连接时未能完成通知: " + rootMessage(error));
+            }
         }
         executor.shutdownNow();
     }

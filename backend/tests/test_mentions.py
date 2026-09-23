@@ -43,13 +43,25 @@ class MentionsTest(unittest.TestCase):
             "大家好",
             [],
             "mxc://chat.example.org/avatar123",
+            "emote",
         )
         self.assertEqual("[原版服]<Steve> 大家好", content["body"])
         self.assertIn(
-            '<img src="mxc://chat.example.org/avatar123" width="24" height="24"',
+            '<img data-mx-emoticon src="mxc://chat.example.org/avatar123" height="24"',
             content["formatted_body"],
         )
-        self.assertIn("[Steve头像]", content["formatted_body"])
+        self.assertIn('alt="Steve头像"', content["formatted_body"])
+
+    def test_text_mode_never_embeds_avatar_fallback_text(self) -> None:
+        content = game_chat_content(
+            "原版服",
+            "Steve",
+            "大家好",
+            [],
+            "mxc://chat.example.org/avatar123",
+        )
+        self.assertEqual("[原版服]<Steve> 大家好", content["body"])
+        self.assertNotIn("formatted_body", content)
 
     def test_untrusted_avatar_uri_is_not_embedded(self) -> None:
         content = game_chat_content(

@@ -48,5 +48,5 @@ docker compose ps matrix-serverchat
 
 echo
 echo "Sticker-label hotfix installed successfully."
-echo "Minecraft at /root/server/1.21leaves was not changed or restarted."
+echo "Minecraft server files were not changed or restarted."
 echo "Send a Matrix sticker and verify that Minecraft displays [贴纸]."

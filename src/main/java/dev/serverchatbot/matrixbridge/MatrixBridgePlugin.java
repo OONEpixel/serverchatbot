@@ -13,18 +13,27 @@ import net.kyori.adventure.text.minimessage.MiniMessage;
 import net.kyori.adventure.text.minimessage.tag.resolver.Placeholder;
 import org.bukkit.command.PluginCommand;
 import org.bukkit.entity.Player;
+import org.bukkit.OfflinePlayer;
+import org.bukkit.Statistic;
 import org.bukkit.plugin.java.JavaPlugin;
 
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
+import java.util.HashMap;
 import java.util.HexFormat;
+import java.util.Map;
 import java.security.SecureRandom;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 public final class MatrixBridgePlugin extends JavaPlugin {
     private static final MiniMessage MINI_MESSAGE = MiniMessage.miniMessage();
+    private static final int LEADERBOARD_LIMIT = 60;
 
     private volatile BridgeConfig bridgeConfig;
     private volatile WebSocketBridge bridge;
+    private final Map<UUID, Long> onlineSinceNanos = new HashMap<>();
 
     @Override
     public void onEnable() {
@@ -37,6 +46,7 @@ public final class MatrixBridgePlugin extends JavaPlugin {
             return;
         }
 
+        getServer().getOnlinePlayers().forEach(this::notePlayerJoin);
         getServer().getPluginManager().registerEvents(new ServerEventListener(this), this);
         BridgeCommand bridgeCommand = new BridgeCommand(this);
         PluginCommand command = getCommand("matrixbridge");
@@ -56,7 +66,7 @@ public final class MatrixBridgePlugin extends JavaPlugin {
         WebSocketBridge current = bridge;
         bridge = null;
         if (current != null) {
-            current.close();
+            current.close(getServer().isStopping());
         }
     }
 
@@ -85,6 +95,14 @@ public final class MatrixBridgePlugin extends JavaPlugin {
         return true;
     }
 
+    public void notePlayerJoin(Player player) {
+        onlineSinceNanos.put(player.getUniqueId(), System.nanoTime());
+    }
+
+    public void notePlayerQuit(Player player) {
+        onlineSinceNanos.remove(player.getUniqueId());
+    }
+
     public String generateAndInstallToken() {
         byte[] bytes = new byte[32];
         new SecureRandom().nextBytes(bytes);
@@ -102,7 +120,7 @@ public final class MatrixBridgePlugin extends JavaPlugin {
         bridge = null;
         bridgeConfig = newConfig;
         if (previous != null) {
-            previous.close();
+            previous.close(false);
         }
         startConfiguredBridge();
     }
@@ -204,16 +222,61 @@ public final class MatrixBridgePlugin extends JavaPlugin {
 
     private void answerOnlinePlayerQuery(BridgeMessage message) {
         getServer().getScheduler().runTask(this, () -> {
-            List<String> playerNames = getServer().getOnlinePlayers().stream()
-                    .map(Player::getName)
-                    .sorted(String.CASE_INSENSITIVE_ORDER)
+            List<? extends Player> onlinePlayers = getServer().getOnlinePlayers().stream()
+                    .sorted((left, right) -> String.CASE_INSENSITIVE_ORDER.compare(
+                            left.getName(), right.getName()))
                     .toList();
 
             JsonObject payload = new JsonObject();
-            payload.addProperty("onlineCount", playerNames.size());
+            payload.addProperty("onlineCount", onlinePlayers.size());
             com.google.gson.JsonArray players = new com.google.gson.JsonArray();
-            playerNames.forEach(players::add);
+            com.google.gson.JsonArray playerDetails = new com.google.gson.JsonArray();
+            long nowNanos = System.nanoTime();
+            for (Player player : onlinePlayers) {
+                players.add(player.getName());
+                long startedNanos = onlineSinceNanos.computeIfAbsent(
+                        player.getUniqueId(), unused -> nowNanos);
+                JsonObject detail = new JsonObject();
+                detail.addProperty("name", player.getName());
+                detail.addProperty("onlineSeconds", Math.max(0L,
+                        TimeUnit.NANOSECONDS.toSeconds(nowNanos - startedNanos)));
+                detail.addProperty("pingMs", Math.max(0, player.getPing()));
+                playerDetails.add(detail);
+            }
             payload.add("playerList", players);
+            payload.add("playerDetails", playerDetails);
+            payload.addProperty("tps1m", getServer().getTPS()[0]);
+            payload.addProperty("mspt", getServer().getAverageTickTime());
+            boolean includeLeaderboard = message.payload().has("includeLeaderboard")
+                    && message.payload().get("includeLeaderboard").isJsonPrimitive()
+                    && message.payload().get("includeLeaderboard").getAsBoolean();
+            if (includeLeaderboard) {
+                List<LeaderboardEntry> leaderboard = new ArrayList<>();
+                for (OfflinePlayer knownPlayer : getServer().getOfflinePlayers()) {
+                    String name = knownPlayer.getName();
+                    if (name == null || name.isBlank()
+                            || (!knownPlayer.hasPlayedBefore() && !knownPlayer.isOnline())) {
+                        continue;
+                    }
+                    long totalTicks = Math.max(0, knownPlayer.getStatistic(Statistic.PLAY_ONE_MINUTE));
+                    leaderboard.add(new LeaderboardEntry(
+                            name, totalTicks / 20L, knownPlayer.isOnline()));
+                }
+                leaderboard.sort(Comparator
+                        .comparingLong(LeaderboardEntry::totalSeconds).reversed()
+                        .thenComparing(LeaderboardEntry::name, String.CASE_INSENSITIVE_ORDER));
+                com.google.gson.JsonArray leaderboardPlayers = new com.google.gson.JsonArray();
+                leaderboard.stream().limit(LEADERBOARD_LIMIT).forEach(entry -> {
+                    JsonObject item = new JsonObject();
+                    item.addProperty("name", entry.name());
+                    item.addProperty("totalPlaySeconds", entry.totalSeconds());
+                    item.addProperty("online", entry.online());
+                    leaderboardPlayers.add(item);
+                });
+                payload.add("leaderboardPlayers", leaderboardPlayers);
+                payload.addProperty("leaderboardTotal", leaderboard.size());
+                payload.addProperty("leaderboardLimit", LEADERBOARD_LIMIT);
+            }
             // Extra correlation data is ignored by the current bot.py but makes
             // logs and future concurrent request handling unambiguous.
             payload.addProperty("requestId", message.id());
@@ -222,6 +285,9 @@ public final class MatrixBridgePlugin extends JavaPlugin {
                 getLogger().warning("在线玩家查询完成时机器人后台已经断开，响应未发送。");
             }
         });
+    }
+
+    private record LeaderboardEntry(String name, long totalSeconds, boolean online) {
     }
 
     private void deliverBindResult(BridgeMessage message) {

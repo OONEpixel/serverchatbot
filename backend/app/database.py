@@ -62,6 +62,14 @@ class PlayerAvatar:
     last_success: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class ReconnectMute:
+    server_id: str
+    player_id: str
+    muted_at: str
+    last_event_at: str
+
+
 class Database:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -135,6 +143,13 @@ class Database:
                 last_attempt TEXT,
                 last_success TEXT
             );
+            CREATE TABLE IF NOT EXISTS reconnect_mutes (
+                server_id TEXT NOT NULL,
+                player_id TEXT NOT NULL COLLATE NOCASE,
+                muted_at TEXT NOT NULL,
+                last_event_at TEXT NOT NULL,
+                PRIMARY KEY (server_id, player_id)
+            );
             """
         )
         server_columns = {
@@ -153,6 +168,20 @@ class Database:
                 self._connection.execute(
                     f"ALTER TABLE servers ADD COLUMN {name} {declaration}"
                 )
+        reconnect_columns = {
+            str(row["name"])
+            for row in self._connection.execute(
+                "PRAGMA table_info(reconnect_mutes)"
+            )
+        }
+        if reconnect_columns and "last_event_at" not in reconnect_columns:
+            self._connection.execute(
+                "ALTER TABLE reconnect_mutes ADD COLUMN last_event_at TEXT"
+            )
+            self._connection.execute(
+                "UPDATE reconnect_mutes SET last_event_at = muted_at "
+                "WHERE last_event_at IS NULL"
+            )
         columns = {
             str(row["name"])
             for row in self._connection.execute("PRAGMA table_info(bindings)")
@@ -614,6 +643,119 @@ class Database:
             """
         ).fetchall()
         return [self._binding(row) for row in rows if row is not None]
+
+    def mute_reconnect_player(self, server_id: str, player_id: str) -> bool:
+        now = datetime.now(timezone.utc).isoformat()
+        cursor = self._connection.execute(
+            """
+            INSERT OR IGNORE INTO reconnect_mutes(
+                server_id, player_id, muted_at, last_event_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (server_id, player_id, now, now),
+        )
+        self._connection.commit()
+        return cursor.rowcount > 0
+
+    def is_reconnect_muted(self, server_id: str, player_id: str) -> bool:
+        row = self._connection.execute(
+            """
+            SELECT 1 FROM reconnect_mutes
+            WHERE server_id = ? AND player_id = ? COLLATE NOCASE
+            """,
+            (server_id, player_id),
+        ).fetchone()
+        return row is not None
+
+    def refresh_reconnect_mute(
+        self,
+        server_id: str,
+        player_id: str,
+        quiet_seconds: int,
+        now: datetime | None = None,
+    ) -> bool:
+        current = now or datetime.now(timezone.utc)
+        row = self._connection.execute(
+            """
+            SELECT muted_at, last_event_at FROM reconnect_mutes
+            WHERE server_id = ? AND player_id = ? COLLATE NOCASE
+            """,
+            (server_id, player_id),
+        ).fetchone()
+        if row is None:
+            return False
+        raw_last_event = str(row["last_event_at"] or row["muted_at"])
+        last_event = datetime.fromisoformat(raw_last_event)
+        if current - last_event >= timedelta(seconds=quiet_seconds):
+            self.clear_reconnect_mute(server_id, player_id)
+            return False
+        self._connection.execute(
+            """
+            UPDATE reconnect_mutes SET last_event_at = ?
+            WHERE server_id = ? AND player_id = ? COLLATE NOCASE
+            """,
+            (current.isoformat(), server_id, player_id),
+        )
+        self._connection.commit()
+        return True
+
+    def expire_reconnect_mutes(
+        self, quiet_seconds: int, now: datetime | None = None
+    ) -> int:
+        current = now or datetime.now(timezone.utc)
+        cutoff = (current - timedelta(seconds=quiet_seconds)).isoformat()
+        cursor = self._connection.execute(
+            "DELETE FROM reconnect_mutes WHERE last_event_at <= ?",
+            (cutoff,),
+        )
+        self._connection.commit()
+        return cursor.rowcount
+
+    def clear_reconnect_mute(self, server_id: str, player_id: str) -> bool:
+        cursor = self._connection.execute(
+            """
+            DELETE FROM reconnect_mutes
+            WHERE server_id = ? AND player_id = ? COLLATE NOCASE
+            """,
+            (server_id, player_id),
+        )
+        self._connection.commit()
+        return cursor.rowcount > 0
+
+    def clear_reconnect_mutes_for_binding(self, binding: Binding) -> int:
+        if binding.scope_id == "*":
+            cursor = self._connection.execute(
+                "DELETE FROM reconnect_mutes WHERE player_id = ? COLLATE NOCASE",
+                (binding.player_id,),
+            )
+        else:
+            cursor = self._connection.execute(
+                """
+                DELETE FROM reconnect_mutes
+                WHERE server_id = ? AND player_id = ? COLLATE NOCASE
+                """,
+                (binding.server_id, binding.player_id),
+            )
+        self._connection.commit()
+        return cursor.rowcount
+
+    def all_reconnect_mutes(self) -> list[ReconnectMute]:
+        rows = self._connection.execute(
+            """
+            SELECT server_id, player_id, muted_at, last_event_at
+            FROM reconnect_mutes
+            ORDER BY muted_at DESC
+            """
+        ).fetchall()
+        return [
+            ReconnectMute(
+                server_id=str(row["server_id"]),
+                player_id=str(row["player_id"]),
+                muted_at=str(row["muted_at"]),
+                last_event_at=str(row["last_event_at"] or row["muted_at"]),
+            )
+            for row in rows
+        ]
 
     def save_binding(
         self,

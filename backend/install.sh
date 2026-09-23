@@ -35,6 +35,19 @@ chmod 0400 secrets/matrix_password
 docker compose config --quiet
 docker compose up -d --build
 
+if command -v systemctl >/dev/null 2>&1 \
+    && [[ "$(command -v docker)" == "/usr/bin/docker" ]] \
+    && systemctl cat docker.service >/dev/null 2>&1; then
+  install -m 0644 matrix-serverchat.service \
+    /etc/systemd/system/matrix-serverchat.service
+  systemctl daemon-reload
+  systemctl enable docker.service
+  systemctl enable matrix-serverchat.service
+  echo "已启用 systemd 开机启动：matrix-serverchat.service"
+else
+  echo "未自动安装 systemd unit；Docker Compose 的 unless-stopped 策略仍然生效。"
+fi
+
 echo
 echo "部署完成。请在游戏/服务器控制台执行 /matrixbridge token generate，"
 echo "再使用 app.admin add-server --prompt-token 完成首次登记。"

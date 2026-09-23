@@ -36,4 +36,4 @@ sudo docker compose exec matrix-serverchat python -m app.admin list-servers
 ```
 
 跨机器连接只使用 `wss://`。若后端仍通过 Compose 绑定
-`127.0.0.1:8765`，应由同机 Nginx/Caddy 终止 TLS 并反向代理 `/minecraft`。
+`127.0.0.1:8766`，应由同机 Nginx/Caddy 终止 TLS 并反向代理 `/minecraft`。
