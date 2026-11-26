@@ -232,6 +232,22 @@ SERVER_HEALTH_GRACE_SECONDS: "30"
 SERVER_HEALTH_MIN_NOTICE_INTERVAL_SECONDS: "60"
 ```
 
+如果 `survival` 服每天早上 06:00 重启网络，可在 `.env` 中加上：
+
+```dotenv
+SERVER_HEALTH_QUIET_START=05:55
+SERVER_HEALTH_QUIET_END=06:15
+SERVER_HEALTH_QUIET_TIMEZONE=Asia/Shanghai
+SERVER_HEALTH_QUIET_SERVER_ID=survival
+```
+
+运行 `sudo docker compose up -d --build matrix-serverchat` 使配置生效。
+静默窗口每天重复，支持跨午夜。窗口内恢复的连接不会触发异常通知；窗口
+结束时仍断开的连接会按原有规则告警。如果窗口开始前已经发出异常告警，
+窗口内恢复时会把恢复通知延至窗口结束。自动重连、`#ping` 和插件主动发送
+的正常停服/重启通知照常运行。开始和结束均留空时禁用静默窗口；服务器 ID
+留空时作用于此后台的所有服务器。
+
 本项目默认 WebSocket 地址为 `ws://127.0.0.1:8766/minecraft`。8765 不再由本
 项目使用，以免与同机其他桥接机器人冲突。
 

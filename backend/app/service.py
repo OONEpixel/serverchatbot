@@ -695,6 +695,13 @@ class MatrixBridgeService:
                     or state.connected != expected_connected
                 ):
                     return
+                quiet_window = self.settings.server_health_quiet_window
+                if not immediate and quiet_window is not None:
+                    quiet_remaining = quiet_window.remaining_seconds(server_id)
+                    if quiet_remaining > 0:
+                        # Recheck local time in case it changes while waiting.
+                        await asyncio.sleep(min(quiet_remaining, 60))
+                        continue
                 remaining = 0 if immediate else (
                     self.settings.server_health_min_notice_interval_seconds
                     - (time.monotonic() - state.last_notice_at)

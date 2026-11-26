@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
+from datetime import datetime, time, tzinfo
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 def _secret(name: str, default: str = "") -> str:
@@ -29,6 +32,52 @@ def _boolean(name: str, default: bool) -> bool:
     if value in {"false", "0", "no", "off"}:
         return False
     raise ValueError(f"{name} must be true or false")
+
+
+@dataclass(frozen=True, slots=True)
+class ServerHealthQuietWindow:
+    start: time
+    end: time
+    timezone: tzinfo
+    server_id: str = ""
+
+    def remaining_seconds(self, server_id: str, now: datetime | None = None) -> float:
+        if self.server_id and self.server_id != server_id:
+            return 0
+        local = (
+            datetime.now(self.timezone) if now is None else now.astimezone(self.timezone)
+        )
+        start = (self.start.hour * 60 + self.start.minute) * 60
+        end = (self.end.hour * 60 + self.end.minute) * 60
+        current = (local.hour * 60 + local.minute) * 60 + local.second
+        current += local.microsecond / 1_000_000
+        elapsed = (current - start) % 86_400
+        return max(0, (end - start) % 86_400 - elapsed)
+
+
+def _server_health_quiet_window() -> ServerHealthQuietWindow | None:
+    start = os.getenv("SERVER_HEALTH_QUIET_START", "").strip()
+    end = os.getenv("SERVER_HEALTH_QUIET_END", "").strip()
+    if not start and not end:
+        return None
+    clock_pattern = r"(?:[01][0-9]|2[0-3]):[0-5][0-9]"
+    if not re.fullmatch(clock_pattern, start) or not re.fullmatch(clock_pattern, end):
+        raise ValueError(
+            "SERVER_HEALTH_QUIET_START and SERVER_HEALTH_QUIET_END must both use HH:MM"
+        )
+    if start == end:
+        raise ValueError("SERVER_HEALTH_QUIET_START and SERVER_HEALTH_QUIET_END must differ")
+    zone_name = os.getenv("SERVER_HEALTH_QUIET_TIMEZONE", "Asia/Shanghai").strip()
+    try:
+        zone = ZoneInfo(zone_name)
+    except (ValueError, ZoneInfoNotFoundError) as error:
+        raise ValueError(f"Invalid SERVER_HEALTH_QUIET_TIMEZONE: {zone_name}") from error
+    return ServerHealthQuietWindow(
+        time.fromisoformat(start),
+        time.fromisoformat(end),
+        zone,
+        os.getenv("SERVER_HEALTH_QUIET_SERVER_ID", "").strip(),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +111,7 @@ class Settings:
     server_health_enabled: bool = True
     server_health_grace_seconds: int = 30
     server_health_min_notice_interval_seconds: int = 60
+    server_health_quiet_window: ServerHealthQuietWindow | None = None
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -123,6 +173,7 @@ class Settings:
             server_health_min_notice_interval_seconds=_positive_int(
                 "SERVER_HEALTH_MIN_NOTICE_INTERVAL_SECONDS", 60
             ),
+            server_health_quiet_window=_server_health_quiet_window(),
         )
         if not settings.matrix_relay_group:
             raise ValueError("MATRIX_RELAY_GROUP must not be blank")

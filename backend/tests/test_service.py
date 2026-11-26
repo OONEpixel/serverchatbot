@@ -4,13 +4,14 @@ import tempfile
 import time
 import unittest
 from dataclasses import replace
+from datetime import UTC, datetime, time as clock_time, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from nio import MatrixRoom, RoomSendResponse, StickerEvent, UploadResponse
 
-from app.config import Settings
+from app.config import ServerHealthQuietWindow, Settings
 from app.protocol import encode, make_envelope
 from app.service import BindToken, MatrixBridgeService, matrix_command
 from app.online_board import render_online_board
@@ -339,6 +340,64 @@ class ServiceTest(unittest.IsolatedAsyncioTestCase):
         self.service._mark_server_connected("vanilla")
         await asyncio.sleep(0.07)
         self.assertEqual([], self.fake_matrix.sent)
+
+    def test_server_health_quiet_window_uses_local_time_and_server_scope(self) -> None:
+        zone = timezone(timedelta(hours=8))
+        window = ServerHealthQuietWindow(clock_time(5, 55), clock_time(6, 15), zone, "vanilla")
+        before_start = datetime(2026, 11, 25, 21, 54, 59, tzinfo=UTC)
+        start = before_start + timedelta(seconds=1)
+        end = start + timedelta(minutes=20)
+        self.assertEqual(0, window.remaining_seconds("vanilla", before_start))
+        self.assertEqual(1200, window.remaining_seconds("vanilla", start))
+        self.assertEqual(0, window.remaining_seconds("survival", start))
+        self.assertEqual(0, window.remaining_seconds("vanilla", end))
+
+        overnight = ServerHealthQuietWindow(clock_time(23, 55), clock_time(0, 5), zone)
+        midnight = datetime(2026, 11, 25, 16, tzinfo=UTC)
+        self.assertEqual(300, overnight.remaining_seconds("vanilla", midnight))
+
+    async def test_health_quiet_window_discards_recovered_outage(self) -> None:
+        window = ServerHealthQuietWindow(clock_time(5, 55), clock_time(6, 15), UTC)
+        self.service.settings = replace(
+            self.service.settings, server_health_grace_seconds=0,
+            server_health_quiet_window=window,
+        )
+        waiting = asyncio.Event()
+
+        def quiet_remaining(server_id):
+            waiting.set()
+            return 600
+
+        with patch.object(
+            ServerHealthQuietWindow, "remaining_seconds", side_effect=quiet_remaining
+        ):
+            self.service._mark_server_connected("vanilla")
+            self.service._mark_server_disconnected("vanilla")
+            state = self.service.server_health["vanilla"]
+            task = state.pending_task
+            await asyncio.wait_for(waiting.wait(), 1)
+            self.assertEqual([], self.fake_matrix.sent)
+            self.service._mark_server_connected("vanilla")
+            await asyncio.gather(task, return_exceptions=True)
+            self.assertIsNone(state.pending_task)
+        self.assertEqual([], self.fake_matrix.sent)
+
+    async def test_health_quiet_window_alerts_if_still_offline_at_end(self) -> None:
+        window = ServerHealthQuietWindow(clock_time(5, 55), clock_time(6, 15), UTC)
+        self.service.settings = replace(
+            self.service.settings, server_health_grace_seconds=0,
+            server_health_min_notice_interval_seconds=0,
+            server_health_quiet_window=window,
+        )
+        with patch.object(
+            ServerHealthQuietWindow, "remaining_seconds", side_effect=[0.01, 0]
+        ) as remaining:
+            self.service._mark_server_connected("vanilla")
+            self.service._mark_server_disconnected("vanilla")
+            await asyncio.wait_for(self.service.server_health["vanilla"].pending_task, 1)
+        self.assertEqual(2, remaining.call_count)
+        self.assertEqual(1, len(self.fake_matrix.sent))
+        self.assertIn("连接异常", self.fake_matrix.sent[-1]["content"]["body"])
 
     async def test_planned_server_stop_and_restart_are_announced_once(self) -> None:
         self.service._mark_server_connected("vanilla")
