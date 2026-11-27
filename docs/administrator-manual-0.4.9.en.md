@@ -269,6 +269,35 @@ systemctl status matrix-serverchat -l --no-pager
 
 The persistence unit manages only `matrix-serverchat`; it does not use `--remove-orphans` or alter another bridge on port 8765. After manual `docker compose stop`, restore with `systemctl restart matrix-serverchat`.
 
+### Quiet hours for a daily network restart
+
+Use a backend build that supports daily quiet hours. For a customized deployment,
+set these keys in the existing `matrix-serverchat` service's `environment:`
+mapping, replacing any existing values. Keep its port mappings and volumes.
+This example covers a daily 06:00 network restart for `survival` in UTC+8.
+
+```yaml
+      SERVER_HEALTH_QUIET_START: "05:55"
+      SERVER_HEALTH_QUIET_END: "06:15"
+      SERVER_HEALTH_QUIET_TIMEZONE: "Asia/Shanghai"
+      SERVER_HEALTH_QUIET_SERVER_ID: "survival"
+```
+
+```bash
+cd /opt/matrix-serverchat
+docker compose config --quiet && docker compose up -d --build matrix-serverchat
+docker compose exec -T matrix-serverchat printenv \
+  SERVER_HEALTH_QUIET_START SERVER_HEALTH_QUIET_END \
+  SERVER_HEALTH_QUIET_TIMEZONE SERVER_HEALTH_QUIET_SERVER_ID
+```
+
+If the connection drops and recovers within the window, Matrix skips both notices.
+If the connection is still down at the end of the window, the backend sends an
+alert. Automatic reconnection and `#ping` continue to work. After the network
+restart, compare the disconnect and reconnect times in
+`docker compose logs --since 30m matrix-serverchat` with the Matrix timeline.
+To verify suppression, use an outage that exceeds the usual alert delay.
+
 ### Status commands
 
 ```bash

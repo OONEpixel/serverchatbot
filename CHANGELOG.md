@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Added a daily quiet window for unexpected Minecraft-to-bridge connection
+  alerts. The backend continues to track connections and alerts at the end of
+  the window if the server is still disconnected.
+
 ## 0.4.9 - 2026-09-23
 
 - Added Matrix and Minecraft shared mini-games: dice, coin toss, and a
